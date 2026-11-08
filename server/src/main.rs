@@ -43,7 +43,6 @@ async fn main() -> anyhow::Result<()> {
         lastfm: LastFm::new(http.clone(), db.clone(), cfg.lastfm_api_key.clone(), cfg.lastfm_api_secret.clone()),
         queue: Mutex::new(Queue::load(&db).await),
         sessions: Mutex::new(HashMap::new()),
-        spotify_pkce: Mutex::new(HashMap::new()),
         tailscale: Arc::new(Mutex::new(tailscale::TailscaleInfo::default())),
         events,
         http,
@@ -66,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     playback::spawn_retry_loop(state.clone());
     services::ytauth::spawn_sync_loop(state.clone());
     services::importers::spawn_lastfm_sync(state.clone());
+    services::spotify::spawn_export_watcher(state.clone());
     services::cache::spawn_purge_loop(state.db.clone());
     state.audio_cache.load().await;
     state.audio_cache.spawn_purge_loop();

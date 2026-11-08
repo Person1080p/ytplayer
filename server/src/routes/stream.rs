@@ -18,8 +18,9 @@ use crate::{
     error::{ApiResult, AppError},
     routes::music::track_or_fetch,
     services::{
-        audiocache,
+        audiocache, missing,
         plex::{self, PlexTrack},
+        spotify,
         ytdlp::AudioLevel,
     },
     state::SharedState,
@@ -88,11 +89,30 @@ async fn plex_match(st: &SharedState, video_id: &str) -> Option<PlexTrack> {
     }
 }
 
+/// The YouTube video behind a song id: itself (or a video picked instead of it), or for a Spotify
+/// song the video it's matched to (matched now if it hasn't been yet — the only time a Spotify
+/// song costs a YouTube search).
+async fn youtube_video(st: &SharedState, video_id: &str) -> Result<String, AppError> {
+    if !spotify::is_spotify_id(video_id) {
+        let picked = crate::services::resolver::video_override(&st.db, video_id).await?;
+        return Ok(picked.unwrap_or_else(|| video_id.to_string()));
+    }
+    match spotify::youtube_id(st, video_id).await {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => {
+            missing::mark(st, video_id, "no match on YouTube").await;
+            Err(AppError::NotConfigured("Couldn't find this song on YouTube or in Plex. Pick one with ⋯ → Change audio source.".into()))
+        }
+        Err(e) => Err(AppError::Other(e)),
+    }
+}
+
 pub async fn source(
     State(st): State<SharedState>,
     Path(video_id): Path<String>,
     Query(q): Query<QualityQuery>,
 ) -> ApiResult<SourceInfo> {
+    spotify::art_on_play(st.clone(), &video_id);
     if let Some(pt) = plex_match(&st, &video_id).await {
         let kbps = st.plex.stream_url(&pt, q.kbps).await.ok().map(|(_, k)| k);
         return Ok(Json(SourceInfo { source: "plex".into(), plex: Some(pt), kbps }));
@@ -100,13 +120,19 @@ pub async fn source(
     if plex::is_plex_id(&video_id) {
         return Err(plex_only_unavailable());
     }
-    if st.audio_cache.peek(&video_id, q.cache_ok()) {
+    let youtube = youtube_video(&st, &video_id).await?;
+    if st.audio_cache.peek(&youtube, q.cache_ok()) {
         return Ok(Json(SourceInfo { source: "cache".into(), plex: None, kbps: Some(audiocache::KBPS) }));
     }
     // Same (cached) resolve the stream itself uses, so this rarely runs yt-dlp.
-    let kbps = match st.ytdlp.resolve(&video_id, q.level(), q.opus()).await {
+    let kbps = match st.ytdlp.resolve(&youtube, q.level(), q.opus()).await {
         Ok(r) => r.kbps.or(Some(q.level().nominal_kbps())),
-        Err(_) => None,
+        Err(e) => {
+            if missing::video_gone(&format!("{e:#}")) {
+                missing::mark(&st, &video_id, &format!("{e:#}")).await;
+            }
+            None
+        }
     };
     Ok(Json(SourceInfo { source: "youtube".into(), plex: None, kbps }))
 }
@@ -135,18 +161,25 @@ pub async fn stream(
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !video_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || video_id.len() > 20 {
+    if !video_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || video_id.len() > 40 {
         return Err(AppError::bad("invalid video id"));
     }
     let range = headers.get(header::RANGE).cloned();
     let quality = q.quality();
+    // A Spotify song's own album art, the first time it plays (not before, to save requests).
+    spotify::art_on_play(st.clone(), &video_id);
+    // The song as the app knows it (a Spotify song plays from a YouTube video below).
+    let song_id = video_id.clone();
 
     let plex_only = plex::is_plex_id(&video_id);
     if q.via.is_none() || plex_only {
         if let Some(pt) = plex_match(&st, &video_id).await {
             let (url, kbps) = st.plex.stream_url(&pt, quality.kbps).await?;
             match proxy(&st.http, &url, range.clone(), &[], None, None).await {
-                Ok(resp) => return Ok(with_kbps(with_source(resp, "plex"), Some(kbps))),
+                Ok(resp) => {
+                    missing::clear(&st, &song_id).await;
+                    return Ok(with_kbps(with_source(resp, "plex"), Some(kbps)));
+                }
                 Err(e) if plex_only => tracing::warn!("plex stream failed for {video_id}: {e:#}"),
                 Err(e) => tracing::warn!("plex stream failed, falling back to youtube: {e:#}"),
             }
@@ -155,12 +188,16 @@ pub async fn stream(
     if plex_only {
         return Err(plex_only_unavailable());
     }
+    let video_id = youtube_video(&st, &video_id).await?;
 
     if q.via.as_deref() != Some("pipe") {
         let from_start = range_start(range.as_ref()) == 0;
         if let Some(path) = st.audio_cache.choose(&video_id, from_start, quality.cache_ok()) {
             match serve_file(path, range.clone()).await {
-                Some(resp) => return Ok(with_kbps(with_source(resp, "cache"), Some(audiocache::KBPS))),
+                Some(resp) => {
+                    missing::clear(&st, &song_id).await;
+                    return Ok(with_kbps(with_source(resp, "cache"), Some(audiocache::KBPS)));
+                }
                 None => tracing::warn!("cached mp3 for {video_id} went missing, streaming from youtube"),
             }
         }
@@ -170,6 +207,13 @@ pub async fn stream(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("yt-dlp resolve {video_id}: {e:#}");
+                    // The video itself is gone: piping it would fail the same way.
+                    if missing::video_gone(&format!("{e:#}")) {
+                        missing::mark(&st, &song_id, &format!("{e:#}")).await;
+                        return Err(AppError::NotConfigured(
+                            "This video isn't available on YouTube any more. Pick another with ⋯ → Change audio source.".into(),
+                        ));
+                    }
                     break;
                 }
             };
@@ -191,7 +235,10 @@ pub async fn stream(
                 },
             });
             match proxy(&st.http, &resolved.url, range.clone(), &extra, Some(&resolved.mime), tee).await {
-                Ok(resp) => return Ok(with_kbps(with_source(resp, "youtube"), resolved.kbps)),
+                Ok(resp) => {
+                    missing::clear(&st, &song_id).await;
+                    return Ok(with_kbps(with_source(resp, "youtube"), resolved.kbps));
+                }
                 Err(e) => {
                     tracing::warn!("googlevideo proxy failed (attempt {attempt}): {e:#}");
                     st.ytdlp.invalidate(&video_id).await;
@@ -201,7 +248,15 @@ pub async fn stream(
     }
 
     // Last resort: pipe yt-dlp's output. No seeking, but works when direct URLs are blocked.
-    let mut child = st.ytdlp.pipe(&video_id, quality.level(), quality.opus()).await?;
+    let mut child = match st.ytdlp.pipe(&video_id, quality.level(), quality.opus()).await {
+        Ok(c) => c,
+        Err(e) => {
+            if missing::video_gone(&format!("{e:#}")) {
+                missing::mark(&st, &song_id, &format!("{e:#}")).await;
+            }
+            return Err(e.into());
+        }
+    };
     let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
     let stream = ReaderStream::new(stdout);
     // Keep the child alive for as long as the body is streaming; it is killed on drop.

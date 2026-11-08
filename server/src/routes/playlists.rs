@@ -207,3 +207,78 @@ pub async fn unlink(State(st): State<SharedState>, Path(id): Path<String>) -> Ap
     st.db.call(move |c| c.execute("DELETE FROM linked_playlists WHERE id=?1", [id])).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
+
+// ---- Spotify playlists ----------------------------------------------------------------------
+
+use crate::services::spotify::{self, SpotifyPlaylist, SpotifySummary};
+
+pub async fn spotify_list(State(st): State<SharedState>) -> ApiResult<Vec<SpotifySummary>> {
+    Ok(Json(spotify::list(&st).await?))
+}
+
+#[derive(Deserialize)]
+pub struct SpotifyImportBody {
+    url: String,
+}
+
+/// Import a Spotify playlist from its link. Reads the list from Spotify only: songs are matched
+/// to audio when they play.
+pub async fn spotify_import(State(st): State<SharedState>, Json(b): Json<SpotifyImportBody>) -> ApiResult<SpotifyPlaylist> {
+    if spotify::playlist_id(&b.url).is_none() {
+        return Err(AppError::bad("That isn't a Spotify playlist link (open.spotify.com/playlist/…)"));
+    }
+    spotify::import(&st, &b.url).await.map(Json).map_err(|e| AppError::bad(format!("{e:#}")))
+}
+
+#[derive(Deserialize)]
+pub struct SpotifyOpenQuery {
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+/// A Spotify playlist: as stored, or synced with Spotify again first when that was a while ago.
+pub async fn spotify_get(
+    State(st): State<SharedState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<SpotifyOpenQuery>,
+) -> ApiResult<SpotifyPlaylist> {
+    spotify::open(&st, &id, q.refresh.is_some()).await?.map(Json).ok_or(AppError::NotFound)
+}
+
+pub async fn spotify_remove(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<serde_json::Value> {
+    spotify::remove(&st, &id).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct SpotifyExportBody {
+    csv: String,
+}
+
+/// The full list of a Spotify playlist from an Exportify CSV (songs past the first 100).
+pub async fn spotify_add_export(
+    State(st): State<SharedState>,
+    Path(id): Path<String>,
+    Json(b): Json<SpotifyExportBody>,
+) -> ApiResult<SpotifyPlaylist> {
+    spotify::add_export(&st, &id, &b.csv).await.map(Json).map_err(|e| AppError::bad(format!("{e:#}")))
+}
+
+#[derive(Deserialize)]
+pub struct ExportDirBody {
+    /// Folder(s) to watch for Exportify downloads (`;`-separated); empty: the Downloads folders.
+    dir: String,
+}
+
+pub async fn spotify_set_export_dir(State(st): State<SharedState>, Json(b): Json<ExportDirBody>) -> ApiResult<serde_json::Value> {
+    let dir = b.dir.trim();
+    if dir.is_empty() {
+        st.db.delete_settings(spotify::EXPORT_DIR_KEY).await?;
+    } else {
+        if let Some(missing) = dir.split(';').map(str::trim).find(|d| !d.is_empty() && !std::path::Path::new(d).is_dir()) {
+            return Err(AppError::bad(format!("The server can't find the folder {missing}")));
+        }
+        st.db.set_setting(spotify::EXPORT_DIR_KEY, dir).await?;
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}

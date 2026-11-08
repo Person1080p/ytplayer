@@ -26,12 +26,6 @@ export default function OAuthReturn() {
           const r = await api.lastfmSession(token);
           toast(`Last.fm connected as ${r.username}`);
           nav("/settings", { replace: true });
-        } else if (provider === "spotify") {
-          const err = params.get("error");
-          if (err) throw new Error(err);
-          await api.library.spotifyExchange(params.get("code") ?? "", params.get("state") ?? "");
-          toast("Spotify connected");
-          nav("/library?import=1", { replace: true });
         } else {
           throw new Error("Unknown provider");
         }

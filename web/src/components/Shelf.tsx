@@ -38,7 +38,7 @@ export function Card({ item, size = 148, onPlay }: { item: HomeItem; size?: numb
         }}
         {...press}
       >
-        <Cover src={item.thumbnail} size={size} round={item.kind === "artist"} />
+        <Cover src={item.thumbnail} size={size} round={item.kind === "artist"} videoId={item.track?.videoId ?? item.videoId} />
         <div className={`card-title ${item.kind === "artist" ? "center" : ""}`}>{item.title}</div>
         {item.subtitle && <div className={`card-sub ${item.kind === "artist" ? "center" : ""}`}>{item.subtitle}</div>}
       </button>

@@ -6,13 +6,17 @@ use futures::{stream, StreamExt};
 
 use crate::{
     models::{HomeItem, Shelf, Track},
-    services::{matching, plex, resolver},
+    services::{matching, plex, resolver, spotify},
     state::AppState,
 };
 
 /// The YouTube video to seed radio with. A Plex-only song has none of its own, so the closest
-/// YouTube Music search result stands in for it (None when there isn't a convincing one).
+/// YouTube Music search result stands in for it (None when there isn't a convincing one); a
+/// Spotify song uses the video it plays from.
 pub async fn youtube_seed(state: &AppState, seed: &Track) -> Option<String> {
+    if spotify::is_spotify_id(&seed.video_id) {
+        return spotify::youtube_id(state, &seed.video_id).await.ok().flatten();
+    }
     if !plex::is_plex_id(&seed.video_id) {
         return Some(seed.video_id.clone());
     }

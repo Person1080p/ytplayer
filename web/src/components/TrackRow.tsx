@@ -15,10 +15,33 @@ export function artUrl(src?: string | null) {
   return `/api/art?u=${encodeURIComponent(src)}`;
 }
 
-export function Cover({ src, size = 48, round = false }: { src?: string | null; size?: number; round?: boolean }) {
+/**
+ * Artwork. With the song's `videoId`, a red ⊗ shows on it while nothing can play the song (no
+ * Plex copy, no YouTube match, or the video is gone).
+ */
+export function Cover({
+  src,
+  size = 48,
+  round = false,
+  videoId,
+}: {
+  src?: string | null;
+  size?: number;
+  round?: boolean;
+  videoId?: string | null;
+}) {
+  const missing = useStore((s) => (videoId ? s.missing.has(videoId) : false));
   return (
     <div className={`cover ${round ? "round" : ""}`} style={{ width: size, height: size }}>
       {src ? <img src={artUrl(src) ?? undefined} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <span>♪</span>}
+      {missing && (
+        <span className="cover-missing" title="No audio found for this song. Pick one with ⋯ → Change audio source." role="img" aria-label="No audio">
+          <svg viewBox="0 0 24 24" width={Math.max(16, Math.min(44, size * 0.42))} height={Math.max(16, Math.min(44, size * 0.42))} aria-hidden>
+            <circle cx="12" cy="12" r="10.5" fill="#e5383b" stroke="#fff" strokeWidth="1.5" />
+            <path d="M8 8l8 8M16 8l-8 8" stroke="#fff" strokeWidth="2.4" strokeLinecap="round" />
+          </svg>
+        </span>
+      )}
     </div>
   );
 }
@@ -41,7 +64,7 @@ export function TrackRow({ track, onPlay, active, leading, trailing, dim }: Prop
     <div className={`track-row ${isActive ? "active" : ""} ${dim ? "dim" : ""}`}>
       {leading}
       <button className="track-main" onClick={onPlay} {...press}>
-        <Cover src={track.thumbnail} />
+        <Cover src={track.thumbnail} videoId={track.videoId} />
         <div className="track-text">
           <div className="track-title">{track.title}</div>
           <div className="track-sub">

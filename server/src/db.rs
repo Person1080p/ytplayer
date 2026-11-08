@@ -71,6 +71,38 @@ CREATE TABLE IF NOT EXISTS linked_playlists (
     added_at   INTEGER NOT NULL
 );
 
+-- Spotify playlists imported from a link: the list as last synced from Spotify (JSON).
+CREATE TABLE IF NOT EXISTS spotify_playlists (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    owner      TEXT,
+    thumbnail  TEXT,
+    count      INTEGER NOT NULL,
+    data       TEXT NOT NULL,
+    synced_at  INTEGER NOT NULL,
+    added_at   INTEGER NOT NULL
+);
+
+-- Songs with no audio anywhere (no Plex copy, no YouTube match, or the video is gone).
+CREATE TABLE IF NOT EXISTS missing_audio (
+    video_id TEXT PRIMARY KEY,
+    reason   TEXT NOT NULL,
+    at       INTEGER NOT NULL
+);
+
+-- A YouTube song played from another video you picked (the automatic one was wrong).
+CREATE TABLE IF NOT EXISTS video_overrides (
+    video_id  TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    at        INTEGER NOT NULL
+);
+
+-- Album art of Spotify songs, looked up when each first plays (the embed page has none).
+CREATE TABLE IF NOT EXISTS spotify_art (
+    track_id TEXT PRIMARY KEY,
+    url      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS liked (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     provider    TEXT NOT NULL,
@@ -149,6 +181,16 @@ impl Db {
                  ALTER TABLE plex_matches ADD COLUMN version INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        // Matching now also looks at YouTube videos: give songs it found nothing for before
+        // another look (once).
+        let resolver_v: Option<String> =
+            conn.query_row("SELECT value FROM settings WHERE key='resolver.version'", [], |r| r.get(0)).optional()?;
+        if resolver_v.as_deref() != Some("2") {
+            conn.execute("DELETE FROM lookup_cache WHERE video_id IS NULL", [])?;
+            conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('resolver.version', '2')", [])?;
+        }
+        // Spotify app keys and login tokens from the removed Spotify API support.
+        conn.execute("DELETE FROM settings WHERE key LIKE 'spotifyapp.%' OR key LIKE 'spotify.%'", [])?;
         // Jobs that were running when the process died will never finish.
         conn.execute(
             "UPDATE import_jobs SET status='failed', error='server restarted', finished_at=?1 WHERE status='running'",

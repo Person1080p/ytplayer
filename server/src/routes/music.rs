@@ -10,7 +10,7 @@ use crate::{
     error::{ApiResult, AppError},
     models::{ArtistPage, GridPage, SearchResults, Shelf, Track},
     services::{
-        matching, plex, recommend,
+        matching, plex, recommend, spotify,
         ytmusic::{HeaderInfo, HomePage, TrackPage},
     },
     state::SharedState,
@@ -75,12 +75,12 @@ pub async fn search(State(st): State<SharedState>, Query(q): Query<SearchQuery>)
 }
 
 pub async fn radio(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<Vec<Track>> {
-    if !plex::is_plex_id(&video_id) {
+    if !plex::is_plex_id(&video_id) && !spotify::is_spotify_id(&video_id) {
         let tracks = st.yt.watch_playlist(Some(&video_id), None, 50).await?;
         st.db.upsert_tracks(tracks.clone()).await?;
         return Ok(Json(tracks));
     }
-    // A Plex-only song: radio from its closest YouTube equivalent, led by the song itself.
+    // A Plex-only or Spotify song: radio from its YouTube equivalent, led by the song itself.
     let seed = track_or_fetch(&st, &video_id).await?;
     let Some(id) = recommend::youtube_seed(&st, &seed).await else { return Ok(Json(vec![seed])) };
     let mut tracks = st.yt.watch_playlist(Some(&id), None, 50).await?;
@@ -149,6 +149,10 @@ pub async fn track(State(st): State<SharedState>, Path(video_id): Path<String>) 
 pub async fn track_or_fetch(st: &SharedState, video_id: &str) -> Result<Track, AppError> {
     if let Some(t) = st.db.get_track(video_id).await? {
         return Ok(t);
+    }
+    // Spotify songs are stored when their playlist is imported; there's nothing to ask YouTube.
+    if spotify::is_spotify_id(video_id) {
+        return Err(AppError::NotFound);
     }
     let t = match plex::rating_key(video_id) {
         Some(rk) => st.plex.track_by_key(rk).await?.ok_or(AppError::NotFound)?.to_track(),
@@ -307,4 +311,106 @@ pub struct GridQuery {
 pub async fn browse_grid(State(st): State<SharedState>, Query(q): Query<GridQuery>) -> ApiResult<GridPage> {
     valid_browse_id(&q.id)?;
     Ok(Json(st.yt.browse_grid(&q.id, q.params.as_deref()).await?))
+}
+
+// ---- a song's YouTube match ---------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct YoutubeMatch {
+    /// `self`: a YouTube song playing from its own video (`track`); `picked`: a YouTube song playing
+    /// from another video you picked (`track`); `matched`: a song from elsewhere playing from
+    /// `track`; `none`: looked up and nothing found; `unknown`: not looked up yet (it is when it
+    /// first plays); `plex`: a Plex-only song.
+    kind: &'static str,
+    track: Option<Track>,
+    /// Nothing can play the song right now.
+    missing: bool,
+}
+
+async fn youtube_match_of(st: &SharedState, video_id: &str) -> Result<YoutubeMatch, AppError> {
+    let missing = crate::services::missing::list(st).await.iter().any(|m| m == video_id);
+    if plex::is_plex_id(video_id) {
+        return Ok(YoutubeMatch { kind: "plex", track: None, missing });
+    }
+    if !spotify::is_spotify_id(video_id) {
+        if let Some(target) = crate::services::resolver::video_override(&st.db, video_id).await? {
+            return Ok(YoutubeMatch { kind: "picked", track: st.db.get_track(&target).await?, missing });
+        }
+        return Ok(YoutubeMatch { kind: "self", track: st.db.get_track(video_id).await?, missing });
+    }
+    let t = track_or_fetch(st, video_id).await?;
+    Ok(match crate::services::resolver::remembered(&st.db, &t.artist, &t.title).await? {
+        Some(Some(id)) => YoutubeMatch { kind: "matched", track: st.db.get_track(&id).await?, missing },
+        Some(None) => YoutubeMatch { kind: "none", track: None, missing },
+        None => YoutubeMatch { kind: "unknown", track: None, missing },
+    })
+}
+
+/// Which YouTube video a song plays from (for songs from other services).
+pub async fn youtube_match(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<YoutubeMatch> {
+    Ok(Json(youtube_match_of(&st, &video_id).await?))
+}
+
+#[derive(Deserialize)]
+pub struct YoutubePick {
+    track: Track,
+}
+
+/// Play a song from this YouTube video from now on (a YouTube song: instead of its own video).
+pub async fn set_youtube_match(
+    State(st): State<SharedState>,
+    Path(video_id): Path<String>,
+    Json(b): Json<YoutubePick>,
+) -> ApiResult<YoutubeMatch> {
+    if plex::is_plex_id(&video_id) {
+        return Err(AppError::bad("This song is only in Plex"));
+    }
+    if spotify::is_spotify_id(&b.track.video_id) || plex::is_plex_id(&b.track.video_id) {
+        return Err(AppError::bad("Pick a YouTube video"));
+    }
+    st.db.upsert_tracks(vec![b.track.clone()]).await?;
+    if spotify::is_spotify_id(&video_id) {
+        let t = track_or_fetch(&st, &video_id).await?;
+        crate::services::resolver::remember(&st.db, &t.artist, &t.title, &b.track.video_id).await?;
+    } else {
+        crate::services::resolver::set_video_override(&st.db, &video_id, Some(&b.track.video_id)).await?;
+    }
+    crate::services::missing::clear(&st, &video_id).await;
+    Ok(Json(youtube_match_of(&st, &video_id).await?))
+}
+
+/// Forget a song's YouTube match and look again now (also past an earlier "nothing found"). A
+/// YouTube song goes back to playing from its own video.
+pub async fn retry_youtube_match(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<YoutubeMatch> {
+    if plex::is_plex_id(&video_id) {
+        return Err(AppError::bad("This song is only in Plex"));
+    }
+    if !spotify::is_spotify_id(&video_id) {
+        crate::services::resolver::set_video_override(&st.db, &video_id, None).await?;
+        crate::services::missing::clear(&st, &video_id).await;
+        return Ok(Json(youtube_match_of(&st, &video_id).await?));
+    }
+    let t = track_or_fetch(&st, &video_id).await?;
+    let found = crate::services::resolver::resolve_opts(&st.yt, &st.db, &t.artist, &t.title, t.duration, true).await?;
+    match found {
+        Some(_) => crate::services::missing::clear(&st, &video_id).await,
+        None => crate::services::missing::mark(&st, &video_id, "no match on YouTube").await,
+    }
+    Ok(Json(youtube_match_of(&st, &video_id).await?))
+}
+
+/// Songs nothing can play right now (shown with a mark on their artwork).
+pub async fn missing(State(st): State<SharedState>) -> ApiResult<Vec<String>> {
+    Ok(Json(crate::services::missing::list(&st).await))
+}
+
+/// YouTube videos only (for picking a song's audio by hand: uploads that aren't in the song catalogue).
+pub async fn search_videos(State(st): State<SharedState>, Query(q): Query<SearchQuery>) -> ApiResult<Vec<Track>> {
+    if q.q.trim().is_empty() {
+        return Ok(Json(vec![]));
+    }
+    let tracks = st.yt.search_videos(&q.q, q.limit.unwrap_or(20)).await?;
+    st.db.upsert_tracks(tracks.clone()).await?;
+    Ok(Json(tracks))
 }

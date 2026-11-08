@@ -136,14 +136,6 @@ pub async fn import_ytmusic(State(st): State<SharedState>) -> ApiResult<JobStart
     Ok(Json(JobStarted { job_id }))
 }
 
-pub async fn import_spotify(State(st): State<SharedState>) -> ApiResult<JobStarted> {
-    if st.db.get_setting("spotify.refresh_token").await?.is_none() {
-        return Err(AppError::NotConfigured("Connect Spotify first".into()));
-    }
-    let job_id = importers::start(st.clone(), "spotify", importers::spotify_liked(st.clone())).await?;
-    Ok(Json(JobStarted { job_id }))
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeezerBody {
@@ -203,50 +195,6 @@ pub async fn import_file(
     let job_id = importers::start(st.clone(), &provider, async move { Ok(items) }).await?;
     Ok(Json(JobStarted { job_id }))
 }
-
-// ---- Spotify OAuth (PKCE) ----------------------------------------------------------------
-// The redirect goes to a page route in the web app (works the same whether the app talks
-// to the server directly or through the in-browser tailnet), which then posts the code here.
-
-#[derive(Serialize)]
-pub struct UrlResponse {
-    url: String,
-}
-
-#[derive(Deserialize)]
-pub struct LoginQuery {
-    redirect: String,
-}
-
-pub async fn spotify_login(State(st): State<SharedState>, Query(q): Query<LoginQuery>) -> ApiResult<UrlResponse> {
-    let client_id = st
-        .cfg
-        .spotify_client_id
-        .clone()
-        .ok_or_else(|| AppError::NotConfigured("Set SPOTIFY_CLIENT_ID on the server".into()))?;
-    let (verifier, challenge) = importers::spotify_pkce();
-    let state_param = uuid::Uuid::new_v4().simple().to_string();
-    st.spotify_pkce.lock().await.insert(state_param.clone(), (verifier, q.redirect.clone()));
-    Ok(Json(UrlResponse { url: importers::spotify_auth_url(&client_id, &q.redirect, &challenge, &state_param) }))
-}
-
-#[derive(Deserialize)]
-pub struct ExchangeBody {
-    code: String,
-    state: String,
-}
-
-pub async fn spotify_exchange(State(st): State<SharedState>, Json(b): Json<ExchangeBody>) -> ApiResult<serde_json::Value> {
-    let (verifier, redirect) = st
-        .spotify_pkce
-        .lock()
-        .await
-        .remove(&b.state)
-        .ok_or_else(|| AppError::bad("Spotify login expired, try again"))?;
-    importers::spotify_exchange(&st, &b.code, &verifier, &redirect).await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
 
 // ---- managing the library -----------------------------------------------------------------
 

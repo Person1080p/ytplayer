@@ -9,6 +9,8 @@ use crate::{
 };
 
 const THRESHOLD: f32 = 0.62;
+/// Videos (the fallback when no song matches) need a closer match.
+const VIDEO_THRESHOLD: f32 = 0.8;
 const NEGATIVE_TTL: i64 = 60 * 60 * 24 * 7;
 
 /// Remember a user's manual choice so future imports of the same song use it.
@@ -23,6 +25,40 @@ pub async fn remember(db: &Db, artist: &str, title: &str, video_id: &str) -> any
         .map(|_| ())
     })
     .await
+}
+
+/// The video a YouTube song plays from instead of its own, when one was picked by hand.
+pub async fn video_override(db: &Db, video_id: &str) -> anyhow::Result<Option<String>> {
+    let v = video_id.to_string();
+    db.call(move |c| c.query_row("SELECT target_id FROM video_overrides WHERE video_id=?1", [v], |r| r.get(0)).optional())
+        .await
+}
+
+/// Play a YouTube song from another video (`None`, or the song's own id, goes back to its own).
+pub async fn set_video_override(db: &Db, video_id: &str, target: Option<&str>) -> anyhow::Result<()> {
+    let (v, t) = (video_id.to_string(), target.filter(|t| *t != video_id).map(str::to_string));
+    db.call(move |c| {
+        match t {
+            Some(t) => c.execute(
+                "INSERT OR REPLACE INTO video_overrides(video_id, target_id, at) VALUES(?1,?2,?3)",
+                params![v, t, now()],
+            ),
+            None => c.execute("DELETE FROM video_overrides WHERE video_id=?1", [v]),
+        }
+        .map(|_| ())
+    })
+    .await
+}
+
+fn key(artist: &str, title: &str) -> String {
+    format!("{}|{}", matching::primary_artist(artist), matching::normalize(title))
+}
+
+/// The remembered match for a song: `Some(Some(id))` matched, `Some(None)` looked up and nothing
+/// found, `None` never looked up.
+pub async fn remembered(db: &Db, artist: &str, title: &str) -> anyhow::Result<Option<Option<String>>> {
+    let k = key(artist, title);
+    db.call(move |c| c.query_row("SELECT video_id FROM lookup_cache WHERE key=?1", [k], |r| r.get(0)).optional()).await
 }
 
 pub async fn resolve(
@@ -79,6 +115,17 @@ pub async fn resolve_opts(
         if simple.trim() != format!("{artist} {title}").to_lowercase().trim() {
             best = pick(yt.search_songs(&simple, 8).await?);
         }
+    }
+    if best.is_none() {
+        // Not in YouTube Music's song catalogue (demos, mixes, uploads only on YouTube): videos,
+        // held to a closer match, since a channel's other uploads ("How to use …") share words.
+        let videos = yt.search_videos(&format!("{artist} {title}"), 10).await?;
+        best = videos
+            .into_iter()
+            .map(|t| (matching::score(title, artist, duration, &t.title, &t.artist, t.duration), t))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .filter(|(s, _)| *s >= VIDEO_THRESHOLD)
+            .map(|(_, t)| t);
     }
 
     if let Some(t) = &best {

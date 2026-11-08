@@ -75,6 +75,8 @@ pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiRes
             "account": st.db.get_setting(ACCOUNT_KEY).await?,
             "syncedAt": st.db.get_setting(COOKIE_SYNCED_KEY).await?.and_then(|s| s.parse::<i64>().ok()),
             "syncError": st.db.get_setting(ytauth::SYNC_ERROR_KEY).await?,
+            // YouTube answers the saved sign-in as signed out (it expired) since this time.
+            "expiredSince": st.yt.session_expired_since().await,
         }),
         plex: json!({
             "connected": plex.is_some(),
@@ -88,8 +90,9 @@ pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiRes
             "username": lastfm_session.map(|(_, u)| u),
         }),
         spotify: json!({
-            "configured": st.cfg.spotify_client_id.is_some(),
-            "connected": st.db.get_setting("spotify.refresh_token").await?.is_some(),
+            // Where Exportify downloads are picked up from, and whether that was set by hand.
+            "exportDirs": crate::services::spotify::export_dirs(&st).await.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+            "exportDirSet": st.db.get_setting(crate::services::spotify::EXPORT_DIR_KEY).await?.is_some(),
         }),
         deezer: json!({ "userId": st.db.get_setting("deezer.user_id").await? }),
         prefs: load_prefs(&st).await,
@@ -240,6 +243,7 @@ pub async fn sync_yt_browser(State(st): State<SharedState>) -> ApiResult<Value> 
 
 pub async fn delete_yt_cookie(State(st): State<SharedState>) -> ApiResult<Value> {
     st.db.delete_settings("ytmusic.cookie").await?; // cookie, source, sync time, account
+    st.yt.reset_session_state().await;
     Ok(ok())
 }
 
@@ -348,6 +352,7 @@ pub async fn plex_set_match(
         return Err(AppError::bad("that song is already a Plex track"));
     }
     let t = st.plex.pin(&video_id, &b.rating_key).await.map_err(|e| AppError::bad(format!("{e:#}")))?;
+    crate::services::missing::clear(&st, &video_id).await;
     Ok(Json(t))
 }
 
@@ -434,13 +439,6 @@ pub async fn plex_art(State(st): State<SharedState>, Query(q): Query<PlexArtQuer
     let mut resp = crate::routes::art::image_response(bytes);
     resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
     Ok(resp)
-}
-
-// ---- Spotify ----------------------------------------------------------------------
-
-pub async fn spotify_disconnect(State(st): State<SharedState>) -> ApiResult<Value> {
-    st.db.delete_settings("spotify.").await?;
-    Ok(ok())
 }
 
 // ---- YouTube request log ------------------------------------------------------------

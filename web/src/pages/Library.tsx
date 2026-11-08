@@ -98,38 +98,6 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
         </button>
       </div>
 
-      <div className="import-row">
-        <div>
-          <strong>Spotify</strong>
-          <div className="muted small">
-            {!status?.spotify.configured
-              ? "Set SPOTIFY_CLIENT_ID on the server"
-              : status.spotify.connected
-                ? "Connected"
-                : `Not connected · redirect URI: ${location.origin}/oauth/spotify`}
-          </div>
-        </div>
-        <div className="row gap">
-          {status?.spotify.configured && !status.spotify.connected && (
-            <button
-              className="btn ghost"
-              onClick={async () => {
-                try {
-                  window.location.href = (await api.library.spotifyLogin(`${location.origin}/oauth/spotify`)).url;
-                } catch (e) {
-                  toast((e as Error).message);
-                }
-              }}
-            >
-              Connect
-            </button>
-          )}
-          <button className="btn" disabled={!status?.spotify.connected} onClick={() => run(api.library.importSpotify(), "Spotify")}>
-            Import
-          </button>
-        </div>
-      </div>
-
       <div className="import-row column">
         <div className="row between">
           <div>

@@ -9,7 +9,7 @@ A self-hosted music player that you install as a PWA on your phone. The backend 
 - **Plex / Plexamp**: if a track also exists in your Plex library, it streams from Plex instead. Codecs the browser can't play are transcoded to MP3.
 - **Last.fm**: now-playing updates, scrobbling with offline retry, loves, and similar-track recommendations blended into radio and autoplay.
 - **Queue**: kept on the server and shared live across devices over SSE. It supports play now / play next / add to queue, drag-to-reorder, shuffle, autoplay top-up, and saving as a playlist.
-- **Imports**: liked tracks from YouTube Music, Spotify (OAuth PKCE), Deezer, **Demus** export files, or any CSV/JSON/M3U/plist/zip export (Exportify, TuneMyMusic, Soundiiz, …). Tracks are matched to YouTube automatically, and YouTube video IDs inside an export are used directly.
+- **Imports**: liked tracks from YouTube Music, Deezer, **Demus** export files, or any CSV/JSON/M3U/plist/zip export (Exportify, TuneMyMusic, Soundiiz, …). Tracks are matched to YouTube automatically, and YouTube video IDs inside an export are used directly.
 - **Tailscale in the web page**: the PWA runs its own Tailscale node, compiled from Go to WebAssembly, so a phone can reach the server **without the Tailscale app or any OS VPN**. The server joins your tailnet by itself too, with a built-in Tailscale node that is on by default. A host `tailscaled` also works.
 
 ```
@@ -122,7 +122,7 @@ All of these are set up in the app under **Settings**, and secrets are stored on
 | YouTube Music | Click **Sign in with Google** on the computer running the server. Sign in on Google's own page, then come back and the server picks up the sign-in from that computer's browser (Firefox, Chrome, Chromium, Brave, Edge, Vivaldi or Opera, read via yt-dlp). With "keep in sync" on, it re-imports every 6 hours, so it doesn't expire while the browser stays signed in. From another device, paste the `cookie` request header instead. Either way, a sign-in is only saved after YouTube confirms which account it belongs to. Search and radio work without it. |
 | Plex | "Sign in with Plex" (PIN flow) → pick a server connection. You can also enter a URL and token manually. |
 | Last.fm | Create an API account, enter the key and secret (or set `LASTFM_API_KEY` / `LASTFM_API_SECRET`), then click Connect. You'll be returned to `<app url>/oauth/lastfm`. |
-| Spotify | Create an app, add `<app url>/oauth/spotify` as a redirect URI, and set `SPOTIFY_CLIENT_ID`. Then go to Library → Import → Connect. |
+| Spotify playlists | Nothing to set up. Paste a playlist link on the Playlists page: the first 100 songs come from Spotify's public page and stay in sync. For longer playlists, “Sync now” copies the link and opens Chosic's playlist exporter; download the CSV there and the server picks it up from your Downloads folder (Settings → Spotify playlists shows or changes the folder). |
 | Deezer | Library → Import → enter your profile ID or URL. The profile must be public, or you can supply an access token. |
 | Demus | In Demus, export or share your library or a playlist and save the file. Then go to Library → Import → Demus → Choose export…. Demus doesn't document its export format, so the importer unpacks zip, gzip, binary/XML plist (including `NSKeyedArchiver`), SQLite/Core Data, JSON and text, and extracts anything track-shaped. YouTube video IDs are used directly. If an export doesn't import, please open an issue with a sample file. |
 | Anything else | Export to CSV or "Artist - Title" lines and use Library → Import → File. |

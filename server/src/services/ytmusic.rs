@@ -26,7 +26,29 @@ const BASE: &str = "https://music.youtube.com/youtubei/v1/";
 const ORIGIN: &str = "https://music.youtube.com";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
 /// Search params for the "Songs" filter.
+/// Setting: when YouTube started answering the saved sign-in as signed out (it expired).
+pub const SESSION_EXPIRED_KEY: &str = "ytmusic.session_expired";
+/// What the last signed-in answer said: 0 not known yet, 1 signed in, 2 signed out (expired).
+static SESSION_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+use std::sync::atomic::Ordering;
+
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Whether YouTube answered as signed in (`logged_in` in `responseContext`), when it says.
+fn response_logged_in(v: &Value) -> Option<bool> {
+    v["responseContext"]["serviceTrackingParams"]
+        .as_array()?
+        .iter()
+        .flat_map(|s| s["params"].as_array().into_iter().flatten())
+        .find(|p| p["key"].as_str() == Some("logged_in"))
+        .and_then(|p| p["value"].as_str())
+        .map(|v| v == "1")
+}
+
 const SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
+const VIDEOS_FILTER: &str = "EgWKAQIQAWoKEAkQBRAKEAMQBA%3D%3D";
 const ARTISTS_FILTER: &str = "EgWKAQIgAWoSEAUQCRAKEAMQEBAEEBUQDhAR";
 const ALBUMS_FILTER: &str = "EgWKAQIYAWoSEAUQCRAKEAMQEBAEEBUQDhAR";
 pub const COOKIE_KEY: &str = "ytmusic.cookie";
@@ -209,6 +231,34 @@ impl YtMusic {
         self.stored_cookie().await
     }
 
+    /// YouTube doesn't refuse an expired sign-in, it answers as if signed out (saying so in
+    /// `responseContext`). Each signed-in answer updates whether that's happening, remembered
+    /// under [`SESSION_EXPIRED_KEY`] (the time it was first seen) until a signed-in answer again.
+    async fn note_session(&self, v: &Value) {
+        let Some(logged_in) = response_logged_in(v) else { return };
+        let state = if logged_in { 1 } else { 2 };
+        if SESSION_STATE.swap(state, Ordering::Relaxed) == state {
+            return;
+        }
+        if logged_in {
+            let _ = self.db.delete_settings(SESSION_EXPIRED_KEY).await;
+        } else if self.db.get_setting(SESSION_EXPIRED_KEY).await.ok().flatten().is_none() {
+            tracing::warn!("YouTube treats the saved sign-in as signed out: it has expired");
+            let _ = self.db.set_setting(SESSION_EXPIRED_KEY, &now_secs().to_string()).await;
+        }
+    }
+
+    /// A new sign-in was saved: forget what the old one did.
+    pub async fn reset_session_state(&self) {
+        SESSION_STATE.store(0, Ordering::Relaxed);
+        let _ = self.db.delete_settings(SESSION_EXPIRED_KEY).await;
+    }
+
+    /// Since when YouTube has been treating the saved sign-in as signed out (expired), if it is.
+    pub async fn session_expired_since(&self) -> Option<i64> {
+        self.db.get_setting(SESSION_EXPIRED_KEY).await.ok().flatten().and_then(|s| s.parse().ok())
+    }
+
     /// Whether a Google sign-in is saved (shown in Settings).
     pub async fn is_authenticated(&self) -> bool {
         self.stored_cookie().await.map(|c| sapisid(&c).is_some()).unwrap_or(false)
@@ -363,6 +413,9 @@ impl YtMusic {
         match resp.json::<Value>().await {
             Ok(v) => {
                 timer.done("ok", code, attempt, None);
+                if matches!(creds, Creds::Cookie(_)) {
+                    self.note_session(&v).await;
+                }
                 Ok(v)
             }
             Err(e) => {
@@ -543,6 +596,19 @@ impl YtMusic {
             .collect();
         // Prefer an exact name match; otherwise YouTube's first artist.
         Ok(ids.iter().find(|(n, _)| *n == want).or(ids.first()).map(|(_, id)| id.clone()))
+    }
+
+    /// Videos only (uploads that aren't in YouTube Music's song catalogue: demos, mixes, live sets).
+    pub async fn search_videos(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
+        let key = self.ckey("search-videos", &format!("{limit}:{}", query.trim().to_lowercase())).await;
+        cache::cached(&self.db, &key, 6 * cache::HOUR, false, || async move {
+            let params = urlencoding::decode(VIDEOS_FILTER)?.into_owned();
+            let v = self.post("search", json!({ "query": query, "params": params }), true).await?;
+            let mut out = parse_responsive_items(&v);
+            out.truncate(limit);
+            Ok(out)
+        })
+        .await
     }
 
     async fn fetch_search_songs(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {

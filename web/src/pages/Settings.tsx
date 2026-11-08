@@ -398,6 +398,77 @@ function LastFm({ status, reload }: { status: Status; reload: () => void }) {
   );
 }
 
+/** Where the server picks up playlist exports (the Downloads folder it found, or one set here). */
+function ExportFolder({ status, reload }: { status: Status; reload: () => void }) {
+  const toast = useStore((s) => s.toastMsg);
+  const [editing, setEditing] = useState(false);
+  const [dir, setDir] = useState("");
+  const dirs = status.spotify.exportDirs ?? [];
+  const save = async (value: string) => {
+    try {
+      await api.playlists.spotifyExportDir(value);
+      setEditing(false);
+      reload();
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+  return (
+    <div className="small" style={{ marginBottom: 10 }}>
+      {dirs.length ? (
+        <>
+          Playlist exports (CSV) are picked up from <code>{dirs.join("; ")}</code>
+          {status.spotify.exportDirSet ? " (set here)" : ""}.{" "}
+        </>
+      ) : (
+        <>The server found no Downloads folder to watch, so drop export files on the playlist page instead. </>
+      )}
+      {!editing ? (
+        <button
+          className="link-btn"
+          onClick={() => {
+            setDir(dirs.join("; "));
+            setEditing(true);
+          }}
+        >
+          Change
+        </button>
+      ) : (
+        <div className="row gap wrap" style={{ marginTop: 6 }}>
+          <input
+            className="input grow"
+            placeholder="Folder on the server, e.g. /mnt/c/Users/you/Downloads"
+            value={dir}
+            onChange={(e) => setDir(e.target.value)}
+          />
+          <button className="btn small" onClick={() => save(dir)}>
+            Save
+          </button>
+          {status.spotify.exportDirSet && (
+            <button className="btn ghost small" onClick={() => save("")}>
+              Use Downloads
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Spotify playlists (Playlists page): where their full lists (exports from Chosic) are picked up. */
+function Spotify({ status, reload }: { status: Status; reload: () => void }) {
+  return (
+    <Section title="Spotify playlists" id="spotify">
+      <p className="muted small">
+        Spotify playlists imported on the Playlists page show their first 100 songs from Spotify's public page. For
+        longer ones, “Sync now” on the playlist copies its link and opens Chosic's playlist exporter: paste the link there
+        and download the CSV, and the server picks the download up by itself and fills in the rest.
+      </p>
+      <ExportFolder status={status} reload={reload} />
+    </Section>
+  );
+}
+
 function ListeningProfile() {
   const p = useProfile();
   const fresh = p.active === "fresh";
@@ -989,6 +1060,12 @@ export default function Settings() {
   useEffect(() => {
     if (location.hash === "#connection") document.getElementById("connection")?.scrollIntoView({ block: "start" });
   }, []);
+  // Links to an account section (e.g. #spotify from Playlists), which appear once status loads.
+  const loaded = !!status;
+  useEffect(() => {
+    const id = location.hash.slice(1);
+    if (loaded && id && id !== "connection") document.getElementById(id)?.scrollIntoView({ block: "start" });
+  }, [loaded]);
 
   return (
     <div className="page">
@@ -1001,6 +1078,7 @@ export default function Settings() {
           <YouTubeMusic status={status} reload={reload} />
           <Plex status={status} reload={reload} />
           <LastFm status={status} reload={reload} />
+          <Spotify status={status} reload={reload} />
           <ListeningProfile />
           <Preferences status={status} reload={reload} />
           <ServerSection status={status} reload={reload} />

@@ -31,6 +31,21 @@ export type Playlist = { id: number; name: string; tracks: Track[] };
 /** A YouTube Music playlist (or album) linked on the Playlists page; opened live, not copied. */
 export type LinkedPlaylist = { id: string; title: string; subtitle?: string | null; thumbnail?: string | null; addedAt: number };
 
+/** A Spotify playlist imported from a link. Its songs have `spotify_…` ids, matched to audio when they play. */
+export type SpotifyPlaylist = {
+  id: string;
+  name: string;
+  owner?: string | null;
+  thumbnail?: string | null;
+  tracks: Track[];
+  /** "embed": at most the first 100 songs; "export": the first 100 from Spotify, the rest from a playlist export (Chosic). */
+  source: "embed" | "export";
+  exportAt?: number | null;
+  syncedAt: number;
+  note?: string | null;
+};
+export type SpotifySummary = { id: string; name: string; owner?: string | null; thumbnail?: string | null; count: number; syncedAt: number };
+
 export type LikedEntry = {
   id: number;
   provider: string;
@@ -148,10 +163,13 @@ export type Status = {
     syncedAt?: number | null;
     /** Why the last refresh from the server's browser failed; the saved sign-in is still used. */
     syncError?: string | null;
+    /** Since when (unix seconds) YouTube treats the saved sign-in as signed out: it expired. */
+    expiredSince?: number | null;
   };
   plex: { connected: boolean; url?: string | null; loggedIn: boolean };
   lastfm: { configured: boolean; keysFromEnv: boolean; connected: boolean; username?: string | null };
-  spotify: { configured: boolean; connected: boolean };
+  /** Spotify playlists: where playlist exports (CSV) are picked up from. */
+  spotify: { exportDirs?: string[]; exportDirSet?: boolean };
   deezer: { userId?: string | null };
   prefs: Prefs;
   /** MP3 copies of YouTube plays kept on the server. `available`: ffmpeg was found. */
@@ -212,6 +230,19 @@ export type SearchResults = {
   fallback?: string;
 };
 export type SearchFilter = "songs" | "artists" | "albums";
+
+/**
+ * A song's YouTube match. `self`: it is a YouTube video; `matched`: plays from `track`; `none`:
+ * nothing found; `unknown`: not looked up yet; `plex`: a Plex-only song.
+ */
+/**
+ * The YouTube video a song plays from. `self`: a YouTube song's own video; `picked`: another video
+ * picked for a YouTube song; `matched`: a song from elsewhere (Spotify) matched to a video.
+ */
+export type YoutubeMatch = { kind: "self" | "picked" | "matched" | "none" | "unknown" | "plex"; track?: Track | null; missing: boolean };
+
+/** Songs from other services (Spotify) are queued under their own ids and matched when they play. */
+export const isSpotifyId = (videoId: string) => /^spotify_[A-Za-z0-9]{22}$/.test(videoId);
 export type BrowseRef = { browseId: string; params?: string | null };
 export type ArtistShelf = { title: string; items: HomeItem[]; more?: BrowseRef | null };
 export type ArtistPage = {
@@ -240,6 +271,8 @@ export const api = {
   podcastMore: (id: string, token: string) => req<TrackPage>(`/podcast/${enc(id)}/more?token=${enc(token)}`),
   discover: () => req<{ shelves: Shelf[] }>("/discover"),
   search: (q: string, signal?: AbortSignal) => req<Track[]>(`/search?q=${enc(q)}`, { signal }),
+  /** YouTube videos only (uploads that aren't in the song catalogue: demos, mixes, live sets). */
+  searchVideos: (q: string) => req<Track[]>(`/search/videos?q=${enc(q)}`),
   searchAll: (q: string, filter?: SearchFilter, signal?: AbortSignal) =>
     req<SearchResults>(`/search/all?q=${enc(q)}${filter ? `&filter=${filter}` : ""}`, { signal }),
   artist: (id: string) => req<ArtistPage>(`/artist/${enc(id)}`),
@@ -291,6 +324,16 @@ export const api = {
     linked: () => req<LinkedPlaylist[]>("/linked-playlists"),
     link: (p: Omit<LinkedPlaylist, "addedAt">) => req<LinkedPlaylist>("/linked-playlists", { body: p }),
     unlink: (id: string) => req<{ ok: boolean }>(`/linked-playlists/${enc(id)}`, { method: "DELETE" }),
+    spotify: () => req<SpotifySummary[]>("/spotify-playlists"),
+    /** Import a Spotify playlist from its link (reads the list only; songs are matched when they play). */
+    spotifyImport: (url: string) => req<SpotifyPlaylist>("/spotify-playlists", { body: { url } }),
+    /** A Spotify playlist, synced with Spotify again first when that was a while ago (or `refresh`). */
+    spotifyGet: (id: string, refresh = false) => req<SpotifyPlaylist>(`/spotify-playlists/${enc(id)}${refresh ? "?refresh=1" : ""}`),
+    spotifyRemove: (id: string) => req<{ ok: boolean }>(`/spotify-playlists/${enc(id)}`, { method: "DELETE" }),
+    /** The full list from a playlist export CSV (songs past the first 100 Spotify's public page shows). */
+    spotifyExport: (id: string, csv: string) => req<SpotifyPlaylist>(`/spotify-playlists/${enc(id)}/export`, { body: { csv } }),
+    /** Folder(s) the server watches for Exportify downloads (empty: the Downloads folders). */
+    spotifyExportDir: (dir: string) => req<{ ok: boolean }>("/spotify/export-dir", { method: "PUT", body: { dir } }),
   },
 
   library: {
@@ -307,9 +350,6 @@ export const api = {
     importLastfm: () => req<{ jobId: number }>("/import/lastfm", { method: "POST" }),
     syncLastfm: () => req<{ jobId: number }>("/library/sync-lastfm", { method: "POST" }),
     importYtMusic: () => req<{ jobId: number }>("/import/ytmusic", { method: "POST" }),
-    importSpotify: () => req<{ jobId: number }>("/import/spotify", { method: "POST" }),
-    spotifyLogin: (redirect: string) => req<{ url: string }>(`/import/spotify/login?redirect=${enc(redirect)}`),
-    spotifyExchange: (code: string, state: string) => req<{ ok: boolean }>("/import/spotify/exchange", { body: { code, state } }),
     importFile: (file: File, provider: string) =>
       req<{ jobId: number }>(`/import/file?provider=${enc(provider)}&name=${enc(file.name)}`, { raw: file }),
     importDeezer: (userId: string, accessToken?: string) =>
@@ -359,7 +399,15 @@ export const api = {
   /** `off`: never play this song from Plex; `auto`: back to automatic matching. */
   plexClearMatch: (videoId: string, mode: "off" | "auto") =>
     req<{ ok: boolean }>(`/plex/matches/${enc(videoId)}?mode=${mode}`, { method: "DELETE" }),
-  spotifyDisconnect: () => req<{ ok: boolean }>("/spotify", { method: "DELETE" }),
+  /** Which YouTube video a song from another service (Spotify) plays from. */
+  youtubeMatch: (videoId: string) => req<YoutubeMatch>(`/tracks/${enc(videoId)}/youtube`),
+  /** Play that song from this YouTube video (a song or video from YouTube search). */
+  setYoutubeMatch: (videoId: string, track: Track) =>
+    req<YoutubeMatch>(`/tracks/${enc(videoId)}/youtube`, { method: "PUT", body: { track } }),
+  /** Look for a YouTube match again now (also after "nothing found"); a YouTube song goes back to its own video. */
+  retryYoutubeMatch: (videoId: string) => req<YoutubeMatch>(`/tracks/${enc(videoId)}/youtube/retry`, { method: "POST" }),
+  /** Songs nothing can play right now. */
+  missing: () => req<string[]>("/missing"),
   authCheck: () => req<{ authenticated: boolean; required: boolean }>("/auth/check"),
   login: (token: string) => req<{ ok: boolean }>("/auth/login", { body: { token } }),
 };

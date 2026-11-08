@@ -109,9 +109,10 @@ async fn record_play(state: SharedState, s: PlaySession) {
     // anonymous visitors.
     let want_scrobble =
         !fresh && state.lastfm.session().await.is_some() && state.db.get_bool("prefs.scrobble", true).await;
-    // A Plex-only song isn't a YouTube video, so there's nothing to report there.
+    // A Plex-only or Spotify song isn't a YouTube video, so there's nothing to report there.
     let want_yt = !fresh
         && !crate::services::plex::is_plex_id(&vid)
+        && !crate::services::spotify::is_spotify_id(&vid)
         && state.yt.signed_in_now().await
         && state.db.get_bool("prefs.report_youtube", true).await;
 

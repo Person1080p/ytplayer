@@ -928,6 +928,11 @@ async function eventLoop() {
     try {
       const res = await apiFetch("/events", { headers: { accept: "text/event-stream" } });
       if (!res.ok || !res.body) throw new Error(`events: ${res.status}`);
+      // Songs with no audio: the full list on (re)connecting, then changes as events.
+      api
+        .missing()
+        .then((ids) => set({ missing: new Set(ids) }))
+        .catch(() => {});
       const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
       let buf = "";
       for (;;) {
@@ -949,6 +954,13 @@ async function eventLoop() {
             if (ev.type === "queue") get().setQueue(ev.queue);
             if (ev.type === "import") set((s) => ({ importTick: s.importTick + 1 }));
             if (ev.type === "profile") loadProfile();
+            if (ev.type === "missing")
+              set((s) => {
+                const m = new Set(s.missing);
+                if (ev.missing) m.add(ev.videoId);
+                else m.delete(ev.videoId);
+                return { missing: m };
+              });
           } catch {
             /* ignore */
           }

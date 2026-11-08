@@ -26,6 +26,8 @@ pub enum ServerEvent {
     Import { job_id: i64 },
     Scrobbled { video_id: String },
     Profile { active: String },
+    /// A song has no audio anywhere (`missing`), or has again.
+    Missing { video_id: String, missing: bool },
 }
 
 pub struct AppState {
@@ -41,8 +43,6 @@ pub struct AppState {
     pub queue: Mutex<Queue>,
     pub sessions: Mutex<HashMap<String, PlaySession>>,
     pub events: broadcast::Sender<ServerEvent>,
-    /// Spotify PKCE: state -> (verifier, redirect_uri)
-    pub spotify_pkce: Mutex<HashMap<String, (String, String)>>,
     pub tailscale: Arc<Mutex<TailscaleInfo>>,
 }
 

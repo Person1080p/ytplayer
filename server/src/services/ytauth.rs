@@ -57,6 +57,7 @@ pub async fn find_session(state: &AppState, only: Option<&str>) -> anyhow::Resul
 }
 
 pub async fn save(state: &AppState, cookie: &str, source: &str) -> anyhow::Result<()> {
+    state.yt.reset_session_state().await;
     state.db.set_setting(COOKIE_KEY, cookie).await?;
     state.db.set_setting(COOKIE_SOURCE_KEY, source).await?;
     state.db.set_setting(COOKIE_SYNCED_KEY, &now().to_string()).await

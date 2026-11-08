@@ -25,6 +25,8 @@ type State = {
   plexMatchTrack: Track | null;
   toast: { id: number; text: string } | null;
   importTick: number;
+  /** Songs nothing can play right now (no Plex copy, no YouTube match, or the video is gone). */
+  missing: Set<string>;
 
   setQueue: (q: Queue) => void;
   toastMsg: (text: string) => void;
@@ -52,6 +54,7 @@ export const useStore = create<State>((set, get) => ({
   plexMatchTrack: null,
   toast: null,
   importTick: 0,
+  missing: new Set(),
 
   setQueue: (q) => {
     const cur = get().queue;

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, isNotConnected, type Shelf } from "../lib/api";
+import { api, isNotConnected, type Shelf, type Status } from "../lib/api";
 import { ShelfView } from "../components/Shelf";
 import ProfileToggle from "../components/ProfileToggle";
 import { useProfile } from "../lib/profile";
@@ -19,6 +19,16 @@ export default function Home() {
   const generation = useRef(0);
   const sentinel = useRef<HTMLDivElement>(null);
 
+  // The YouTube sign-in expired (YouTube answers as if signed out) and refreshing it failed:
+  // why, for the warning next to Refresh. Checked after the feed loads, since that request is
+  // what tells the server whether the sign-in still works.
+  const [tokenWarn, setTokenWarn] = useState<string | null>(null);
+  const checkToken = () =>
+    api
+      .status()
+      .then((s) => setTokenWarn(tokenProblem(s.ytmusic)))
+      .catch(() => {});
+
   const [refreshing, setRefreshing] = useState(false);
   const load = (refresh = false) => {
     const gen = ++generation.current;
@@ -32,7 +42,10 @@ export default function Home() {
         setNext(r.continuation ?? null);
       })
       .catch((e) => (isNotConnected(e) ? setOffline(true) : setError(e.message)))
-      .finally(() => setRefreshing(false));
+      .finally(() => {
+        setRefreshing(false);
+        checkToken();
+      });
     api.discover().then((r) => setPersonal(r.shelves)).catch(() => {});
   };
   useEffect(() => {
@@ -82,6 +95,15 @@ export default function Home() {
         <h1>Listen now</h1>
         <div className="row gap">
           <ProfileToggle compact />
+          {tokenWarn && (
+            <Link to="/settings" className="token-warn" title={tokenWarn} aria-label={`Token Expired. ${tokenWarn}`}>
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden>
+                <path d="M10.3 3.9 1.9 18a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" fill="#e5383b" />
+                <path d="M12 9v4.5M12 17h.01" stroke="#fff" strokeWidth="2.2" strokeLinecap="round" />
+              </svg>
+              Token Expired
+            </Link>
+          )}
           <button className="btn ghost small" disabled={refreshing} onClick={() => load(true)} title="Get a fresh feed from YouTube Music">
             {refreshing ? "Refreshing…" : "Refresh"}
           </button>
@@ -117,5 +139,34 @@ export default function Home() {
         </p>
       )}
     </div>
+  );
+}
+
+const BROWSER_NAMES: Record<string, string> = {
+  firefox: "Firefox",
+  chrome: "Chrome",
+  chromium: "Chromium",
+  brave: "Brave",
+  edge: "Edge",
+  vivaldi: "Vivaldi",
+  opera: "Opera",
+};
+
+/**
+ * Why the YouTube sign-in needs attention, or null: YouTube treats it as signed out (it expired)
+ * and the last refresh from the browser failed (or it was pasted by hand, which can't refresh).
+ */
+function tokenProblem(y: Status["ytmusic"]): string | null {
+  if (!y.authenticated || !y.expiredSince) return null;
+  const browser = y.source?.startsWith("browser:") ? y.source.slice(8).split(":")[0] : null;
+  if (browser && !y.syncError) return null; // the next refresh from the browser may still fix it
+  const since = new Date(y.expiredSince * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  const refresh = browser
+    ? `Refreshing it from ${BROWSER_NAMES[browser] ?? browser} on the server failed too: ${y.syncError}`
+    : "It was pasted in by hand, so it can't refresh itself.";
+  return (
+    `Your YouTube Music sign-in has expired: since ${since}, YouTube treats the app as a signed-out visitor, ` +
+    `so Home shows general picks instead of your mixes, and your likes and history aren't used. ${refresh} ` +
+    `Click to sign in again in Settings.`
   );
 }

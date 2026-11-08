@@ -21,7 +21,6 @@ pub struct Config {
     pub access_token: Option<String>,
     pub lastfm_api_key: Option<String>,
     pub lastfm_api_secret: Option<String>,
-    pub spotify_client_id: Option<String>,
     pub ytdlp_path: Option<PathBuf>,
     /// Where the managed yt-dlp is kept. Defaults to `<data>/bin`; point it at a local disk when
     /// the data dir is on a network share, since yt-dlp is read in full on every start.
@@ -45,7 +44,6 @@ impl Config {
             access_token: env("YTP_ACCESS_TOKEN"),
             lastfm_api_key: env("LASTFM_API_KEY"),
             lastfm_api_secret: env("LASTFM_API_SECRET"),
-            spotify_client_id: env("SPOTIFY_CLIENT_ID"),
             ytdlp_path: env("YTDLP_PATH").map(PathBuf::from),
             bin_dir: env("YTP_BIN_DIR").map(PathBuf::from).unwrap_or_else(|| data_dir.join("bin")),
             tailscale: TailscaleConfig {

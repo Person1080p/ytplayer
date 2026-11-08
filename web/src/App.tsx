@@ -16,7 +16,7 @@ import Search from "./pages/Search";
 import Collection from "./pages/Collection";
 import Artist, { ArtistByName, BrowseGrid } from "./pages/Artist";
 import QueuePage from "./pages/QueuePage";
-import { PlaylistDetail, PlaylistsPage } from "./pages/Playlists";
+import { PlaylistDetail, PlaylistsPage, SpotifyPlaylistPage } from "./pages/Playlists";
 import Library from "./pages/Library";
 import Settings from "./pages/Settings";
 
@@ -153,6 +153,7 @@ export default function App() {
           <Route path="/queue" element={<QueuePage />} />
           <Route path="/playlists" element={<PlaylistsPage />} />
           <Route path="/playlists/:id" element={<PlaylistDetail />} />
+          <Route path="/spotify/:id" element={<SpotifyPlaylistPage />} />
           <Route path="/library" element={<Library />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/oauth/:provider" element={<OAuthReturn />} />

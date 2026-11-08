@@ -40,6 +40,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/discover", get(music::discover))
         .route("/search", get(music::search))
         .route("/search/all", get(music::search_all))
+        .route("/search/videos", get(music::search_videos))
         .route("/artist/{id}", get(music::artist))
         .route("/artist-lookup", get(music::artist_lookup))
         .route("/browse/grid", get(music::browse_grid))
@@ -51,6 +52,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/recommendations/{video_id}", get(music::recommendations))
         .route("/tracks/{video_id}", get(music::track))
         .route("/tracks/{video_id}/source", get(stream::source))
+        .route("/tracks/{video_id}/youtube", get(music::youtube_match).put(music::set_youtube_match))
+        .route("/tracks/{video_id}/youtube/retry", post(music::retry_youtube_match))
+        .route("/missing", get(music::missing))
         .route("/stream/{video_id}", get(stream::stream))
         .route("/history", get(music::history))
         .route("/playback", post(settings::playback_event))
@@ -70,6 +74,13 @@ pub fn router(state: SharedState) -> Router {
         .route("/playlists/{id}", get(playlists::get).put(playlists::update).delete(playlists::delete))
         .route("/linked-playlists", get(playlists::linked).post(playlists::link))
         .route("/linked-playlists/{id}", delete(playlists::unlink))
+        .route("/spotify-playlists", get(playlists::spotify_list).post(playlists::spotify_import))
+        .route("/spotify-playlists/{id}", get(playlists::spotify_get).delete(playlists::spotify_remove))
+        .route(
+            "/spotify-playlists/{id}/export",
+            post(playlists::spotify_add_export).layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/spotify/export-dir", put(playlists::spotify_set_export_dir))
         // library + imports
         .route("/library/liked", get(library::liked).post(library::add))
         .route("/library/liked/{id}", delete(library::remove))
@@ -82,9 +93,6 @@ pub fn router(state: SharedState) -> Router {
         .route("/art", get(art::art))
         .route("/import/jobs", get(library::jobs))
         .route("/import/ytmusic", post(library::import_ytmusic))
-        .route("/import/spotify", post(library::import_spotify))
-        .route("/import/spotify/login", get(library::spotify_login))
-        .route("/import/spotify/exchange", post(library::spotify_exchange))
         .route("/import/deezer", post(library::import_deezer))
         .route("/import/text", post(library::import_text))
         .route(
@@ -115,7 +123,6 @@ pub fn router(state: SharedState) -> Router {
             get(settings::plex_get_match).put(settings::plex_set_match).delete(settings::plex_clear_match),
         )
         .route("/plex/art", get(settings::plex_art))
-        .route("/spotify", delete(settings::spotify_disconnect))
         .route("/profile", get(profile::get).put(profile::set))
         .route("/profile/fresh/reset", post(profile::reset_fresh))
         .route("/events", get(events))

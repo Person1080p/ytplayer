@@ -1,10 +1,8 @@
-//! Importing liked tracks from YouTube Music, Spotify, Deezer and CSV/text exports.
+//! Importing liked tracks from YouTube Music, Deezer and CSV/text exports.
 
 use anyhow::{bail, Context};
-use base64::Engine;
 use rusqlite::params;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use std::collections::{HashMap, HashSet};
 
@@ -156,7 +154,9 @@ async fn process_items(
 /// Make sure a track row exists for an item that already carries a YouTube id.
 /// Uses the export's own metadata when complete, otherwise asks YouTube.
 async fn ensure_track(state: &SharedState, video_id: &str, it: &ImportItem) {
-    if matches!(state.db.get_track(video_id).await, Ok(Some(_))) || crate::services::plex::is_plex_id(video_id) {
+    if matches!(state.db.get_track(video_id).await, Ok(Some(_))) || crate::services::plex::is_plex_id(video_id)
+        || crate::services::spotify::is_spotify_id(video_id)
+    {
         return;
     }
     let track = if !it.title.is_empty() && !it.artist.is_empty() {
@@ -628,117 +628,7 @@ pub async fn ytmusic_liked(state: SharedState) -> anyhow::Result<Vec<ImportItem>
         .collect())
 }
 
-// ---- Spotify (Authorization Code + PKCE, no client secret needed) -------------
 
-pub fn spotify_pkce() -> (String, String) {
-    use rand::Rng;
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
-    let verifier: String = (0..64).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect();
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    (verifier, challenge)
-}
-
-pub fn spotify_auth_url(client_id: &str, redirect: &str, challenge: &str, state: &str) -> String {
-    format!(
-        "https://accounts.spotify.com/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge_method=S256&code_challenge={}&state={}&scope={}",
-        urlencoding::encode(client_id),
-        urlencoding::encode(redirect),
-        challenge,
-        state,
-        urlencoding::encode("user-library-read playlist-read-private")
-    )
-}
-
-async fn spotify_store_tokens(state: &SharedState, v: &Value) -> anyhow::Result<String> {
-    let access = v["access_token"].as_str().context("no access_token")?.to_string();
-    state.db.set_setting("spotify.access_token", &access).await?;
-    if let Some(r) = v["refresh_token"].as_str() {
-        state.db.set_setting("spotify.refresh_token", r).await?;
-    }
-    let exp = now() + v["expires_in"].as_i64().unwrap_or(3600) - 60;
-    state.db.set_setting("spotify.expires_at", &exp.to_string()).await?;
-    Ok(access)
-}
-
-pub async fn spotify_exchange(state: &SharedState, code: &str, verifier: &str, redirect: &str) -> anyhow::Result<()> {
-    let client_id = state.cfg.spotify_client_id.clone().context("SPOTIFY_CLIENT_ID not set")?;
-    let v: Value = state
-        .http
-        .post("https://accounts.spotify.com/api/token")
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect),
-            ("client_id", &client_id),
-            ("code_verifier", verifier),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    spotify_store_tokens(state, &v).await.map(|_| ())
-}
-
-async fn spotify_token(state: &SharedState) -> anyhow::Result<String> {
-    let exp: i64 = state.db.get_setting("spotify.expires_at").await?.and_then(|s| s.parse().ok()).unwrap_or(0);
-    if exp > now() {
-        if let Some(t) = state.db.get_setting("spotify.access_token").await? {
-            return Ok(t);
-        }
-    }
-    let refresh = state.db.get_setting("spotify.refresh_token").await?.context("Spotify not connected")?;
-    let client_id = state.cfg.spotify_client_id.clone().context("SPOTIFY_CLIENT_ID not set")?;
-    let v: Value = state
-        .http
-        .post("https://accounts.spotify.com/api/token")
-        .form(&[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", &client_id)])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    spotify_store_tokens(state, &v).await
-}
-
-pub async fn spotify_liked(state: SharedState) -> anyhow::Result<Vec<ImportItem>> {
-    let mut out = Vec::new();
-    let mut url = Some("https://api.spotify.com/v1/me/tracks?limit=50".to_string());
-    while let Some(u) = url.take() {
-        let token = spotify_token(&state).await?;
-        let resp = state.http.get(&u).bearer_auth(token).send().await?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let wait = resp.headers().get("retry-after").and_then(|h| h.to_str().ok()?.parse().ok()).unwrap_or(5);
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-            url = Some(u);
-            continue;
-        }
-        let v: Value = resp.error_for_status()?.json().await?;
-        for it in v["items"].as_array().into_iter().flatten() {
-            let t = &it["track"];
-            let Some(id) = t["id"].as_str() else { continue };
-            out.push(ImportItem {
-                provider_id: id.to_string(),
-                title: t["name"].as_str().unwrap_or_default().to_string(),
-                artist: t["artists"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", "))
-                    .unwrap_or_default(),
-                album: t["album"]["name"].as_str().map(String::from),
-                duration: t["duration_ms"].as_u64().map(|ms| (ms / 1000) as u32),
-                video_id: None,
-            });
-        }
-        url = v["next"].as_str().map(String::from);
-    }
-    Ok(out)
-}
-
-// ---- Deezer -----------------------------------------------------------------
-
-/// Deezer favourites. Works without auth when the user's profile is public;
-/// an access token (from an existing Deezer app) can be supplied for private profiles.
 pub async fn deezer_favorites(http: reqwest::Client, user_id: String, token: Option<String>) -> anyhow::Result<Vec<ImportItem>> {
     let mut out = Vec::new();
     let mut url = Some(format!("https://api.deezer.com/user/{}/tracks?limit=100", urlencoding::encode(&user_id)));

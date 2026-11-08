@@ -254,7 +254,7 @@ export function PlayerBar() {
       <Seekbar />
       <div className="player-bar-inner">
         <button className="player-bar-info" onClick={() => open(true)}>
-          <Cover src={track.thumbnail} size={44} />
+          <Cover src={track.thumbnail} size={44} videoId={track.videoId} />
           <div className="track-text">
             <div className="track-title">{track.title}</div>
             <div className="track-sub">
@@ -310,7 +310,7 @@ export function NowPlaying() {
         </button>
       </header>
       <div className="np-art">
-        <Cover src={track.thumbnail} size={340} />
+        <Cover src={track.thumbnail} size={340} videoId={track.videoId} />
       </div>
       <div className="np-meta">
         <h2>{track.title}</h2>
