@@ -32,10 +32,17 @@ if ! npm_path="$(command -v npm)" || [[ "$npm_path" == /mnt/* ]]; then
   exit 1
 fi
 
-if [[ -n "$wsl" && "$root" == /mnt/* ]]; then
-  # The project lives on a Windows drive: keep Rust's build output on the Linux filesystem
-  # (far faster than building over drvfs/SMB), and poll for changes because WSL gets no
-  # file-change events for edits made from Windows.
+# Is the project on a network share? A Windows drive under WSL, or a GVFS mount on Linux
+# (e.g. /run/user/1000/gvfs/smb-share:server=…). GVFS paths contain ':', which cargo can't put
+# into LD_LIBRARY_PATH for `cargo run`, so the build output must live elsewhere there anyway.
+on_share=""
+[[ -n "$wsl" && "$root" == /mnt/* ]] && on_share=1
+[[ "$root" == */gvfs/* || "$root" == *:* ]] && on_share=1
+
+if [[ -n "$on_share" ]]; then
+  # Keep Rust's build output on the local filesystem (far faster than building over
+  # drvfs/SMB, and free of ':' in its path), and poll for changes because edits made on
+  # another machine (or from Windows) don't produce file-change events here.
   export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/ytp/server-target}"
   export CHOKIDAR_USEPOLLING="${CHOKIDAR_USEPOLLING:-1}"
   # yt-dlp is a 40 MB self-unpacking binary read in full on every run (each new song): ~6 s from
@@ -45,7 +52,7 @@ if [[ -n "$wsl" && "$root" == /mnt/* ]]; then
     mkdir -p "$YTP_BIN_DIR"
     cp "$root/server/data/bin/yt-dlp" "$YTP_BIN_DIR/yt-dlp" && chmod +x "$YTP_BIN_DIR/yt-dlp"
   fi
-  # Network shares mounted in WSL can't hold symlinks, so npm can't link node_modules/.bin.
+  # Network shares (drvfs, GVFS) can't hold symlinks, so npm can't link node_modules/.bin.
   npm_ci_flags="--no-bin-links"
 fi
 
