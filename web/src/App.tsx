@@ -4,13 +4,14 @@ import { api } from "./lib/api";
 import { initPlayer } from "./lib/player";
 import { loadProfile, useProfile } from "./lib/profile";
 import { loadLibraryIds } from "./lib/library";
+import { fetchStatus } from "./lib/serverStatus";
 import ProfileToggle from "./components/ProfileToggle";
 import { useTailnet } from "./lib/tailnet";
 import { setToken as saveToken, useConnection, useTransportReady, watchConnection } from "./lib/transport";
 import OAuthReturn from "./pages/OAuthReturn";
 import { HomeIcon, LibraryIcon, ListIcon, QueueIcon, SearchIcon, SettingsIcon } from "./components/Icons";
 import { NowPlaying, PlayerBar } from "./components/Player";
-import { PlaylistPicker, PlexVersionSheet, Toast, TrackMenu } from "./components/Sheets";
+import { AudioSourceSheet, PlaylistPicker, Toast, TrackMenu } from "./components/Sheets";
 import Home from "./pages/Home";
 import Search from "./pages/Search";
 import Collection from "./pages/Collection";
@@ -118,6 +119,7 @@ export default function App() {
       initPlayer();
       loadProfile();
       loadLibraryIds();
+      fetchStatus().catch(() => {});
     }
   }, [online]);
 
@@ -171,7 +173,7 @@ export default function App() {
       <NowPlaying />
       <TrackMenu />
       <PlaylistPicker />
-      <PlexVersionSheet />
+      <AudioSourceSheet />
       <Toast />
     </div>
   );

@@ -1,8 +1,9 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { fmtTime, type Track } from "../lib/api";
 import { currentTrack, useStore } from "../lib/store";
 import { usePressMenu } from "../lib/pressMenu";
 import { isTailnet } from "../lib/transport";
+import { useLocalArt } from "../lib/localFolder";
 import { MoreIcon } from "./Icons";
 
 /**
@@ -31,9 +32,18 @@ export function Cover({
   videoId?: string | null;
 }) {
   const missing = useStore((s) => (videoId ? s.missing.has(videoId) : false));
+  // A song from the music folder on this device: its cover is in the folder's index.
+  const localArt = useLocalArt(src ? null : videoId);
+  src = src || localArt;
+  // Artwork that failed to load (a library track without a cover answers 404): the placeholder.
+  const [broken, setBroken] = useState<string | null>(null);
   return (
     <div className={`cover ${round ? "round" : ""}`} style={{ width: size, height: size }}>
-      {src ? <img src={artUrl(src) ?? undefined} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <span>♪</span>}
+      {src && src !== broken ? (
+        <img src={artUrl(src) ?? undefined} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setBroken(src)} />
+      ) : (
+        <span>♪</span>
+      )}
       {missing && (
         <span className="cover-missing" title="No audio found for this song. Pick one with ⋯ → Change audio source." role="img" aria-label="No audio">
           <svg viewBox="0 0 24 24" width={Math.max(16, Math.min(44, size * 0.42))} height={Math.max(16, Math.min(44, size * 0.42))} aria-hidden>

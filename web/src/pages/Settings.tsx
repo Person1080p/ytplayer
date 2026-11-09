@@ -1,7 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import QRCode from "qrcode";
-import { api, type PlexServer, type Prefs, type Status, type YtLog, type YtLogWindow } from "../lib/api";
+import {
+  api,
+  SOURCE_LABELS,
+  type PlexServer,
+  type Prefs,
+  type SourceId,
+  type SourcePref,
+  type Status,
+  type YtLog,
+  type YtLogWindow,
+} from "../lib/api";
+import { fetchStatus, youtubeOn } from "../lib/serverStatus";
+import {
+  canKeepFolder,
+  canPickFolder,
+  forgetFolder,
+  pickFolder,
+  reconnectFolder,
+  rescanFolder,
+  useMusicFolder,
+  type FolderState,
+} from "../lib/localFolder";
+import { APP_BUILT_AT, APP_COMMIT, APP_DIRTY } from "../lib/buildInfo";
+import { ChevronDown, ChevronUp } from "../components/Icons";
 import { useStore } from "../lib/store";
 import { tailnetLogout, useTailnet } from "../lib/tailnet";
 import {
@@ -101,6 +124,25 @@ function YouTubeMusic({ status, reload }: { status: Status; reload: () => void }
     return () => document.removeEventListener("visibilitychange", onVisible);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opened]);
+
+  if (!youtubeOn(status)) {
+    return (
+      <Section title="YouTube Music" state="off">
+        <p className="muted small">
+          YouTube is turned off in Audio sources above, so the app doesn't use YouTube Music: search, the home feed and radio
+          come from your libraries.
+        </p>
+        {yt.authenticated && (
+          <div className="row gap wrap">
+            <span className="small">Signed in{yt.account ? <> as <strong>{yt.account}</strong></> : null} (not used while off).</span>
+            <button className="btn ghost small danger" onClick={() => api.deleteYtCookie().then(reload)}>
+              Sign out
+            </button>
+          </div>
+        )}
+      </Section>
+    );
+  }
 
   const synced = browserName(yt.source);
 
@@ -280,8 +322,8 @@ function Plex({ status, reload }: { status: Status; reload: () => void }) {
   return (
     <Section title="Plex / Plexamp" state={status.plex.connected ? "ok" : "off"}>
       <p className="muted small">
-        When a track also exists in your Plex music library, it's streamed from Plex instead of YouTube (lossless if your
-        files are).
+        When a track also exists in your Plex music library, it can play from Plex (lossless if your files are), in the
+        order set in Audio sources.
       </p>
       {status.plex.connected ? (
         <div className="row gap wrap">
@@ -341,6 +383,398 @@ function Plex({ status, reload }: { status: Status; reload: () => void }) {
           </button>
         </div>
       </details>
+    </Section>
+  );
+}
+
+/** Unix seconds from a timestamp in seconds or milliseconds. */
+const toSecs = (ts?: number | null) => (ts ? (ts > 1e12 ? Math.round(ts / 1000) : ts) : null);
+
+const SOURCE_DEFAULTS: SourcePref[] = [
+  { id: "plex", on: true },
+  { id: "jellyfin", on: true },
+  { id: "local", on: true },
+  { id: "youtube", on: true },
+];
+
+/** All four sources once each, in the saved order (any missing ones at the end). */
+function normalizeSources(list?: SourcePref[] | null): SourcePref[] {
+  const out = (list ?? []).filter(
+    (p, i, all) => SOURCE_DEFAULTS.some((d) => d.id === p.id) && all.findIndex((q) => q.id === p.id) === i,
+  );
+  for (const d of SOURCE_DEFAULTS) if (!out.some((p) => p.id === d.id)) out.push({ ...d });
+  return out;
+}
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+/** One line on whether a source is set up, for the Audio sources list. */
+function sourceState(id: SourceId, s: Status, folder: FolderState): { text: string; ready: boolean } {
+  switch (id) {
+    case "plex":
+      return s.plex.connected
+        ? { text: `Connected${s.plex.url ? ` · ${s.plex.url}` : ""}`, ready: true }
+        : { text: "Not connected (see Plex below)", ready: false };
+    case "jellyfin": {
+      const jf = s.jellyfin;
+      return jf?.connected
+        ? { text: `Connected to ${jf.serverName ?? jf.url ?? "Jellyfin"}${jf.user ? ` as ${jf.user}` : ""}`, ready: true }
+        : { text: "Not connected (see Jellyfin below)", ready: false };
+    }
+    case "local": {
+      // The folder is on this device, so this row is about this device only.
+      if (folder.state === "none") return { text: "No folder on this device (see Music folder below)", ready: false };
+      if (folder.state === "permission") return { text: "Needs a click to read the folder again (see Music folder below)", ready: false };
+      if (folder.state === "repick") return { text: "Pick the folder again for this visit (see Music folder below)", ready: false };
+      if (folder.scanning) return { text: `Scanning… ${plural(folder.scanned, "file")} so far`, ready: true };
+      return { text: `${plural(folder.tracks, "track")} in “${folder.name}” on this device`, ready: folder.tracks > 0 };
+    }
+    case "youtube": {
+      const y = s.ytmusic;
+      return {
+        text: y.authenticated ? `Signed in${y.account ? ` as ${y.account}` : ""}` : "Not signed in (anonymous)",
+        ready: true,
+      };
+    }
+  }
+}
+
+/**
+ * Where songs play from, in order: the first source that has a song plays it. Each can be turned
+ * off; with YouTube off the app runs on your libraries only.
+ */
+function AudioSources({ status, reload }: { status: Status; reload: () => void }) {
+  const toast = useStore((s) => s.toastMsg);
+  const [list, setList] = useState(() => normalizeSources(status.prefs.sources));
+  useEffect(() => setList(normalizeSources(status.prefs.sources)), [status.prefs.sources]);
+  const listRef = useRef<HTMLOListElement>(null);
+  // After a move, keep keyboard focus on the moved row's button (or its other one at the ends).
+  const focusAfter = useRef<{ id: SourceId; dir: "up" | "down" } | null>(null);
+  useEffect(() => {
+    const f = focusAfter.current;
+    if (!f) return;
+    focusAfter.current = null;
+    const btn = (dir: string) => listRef.current?.querySelector<HTMLButtonElement>(`[data-move="${f.id}-${dir}"]`);
+    const el = btn(f.dir);
+    (el && !el.disabled ? el : btn(f.dir === "up" ? "down" : "up"))?.focus();
+  }, [list]);
+
+  const save = async (next: SourcePref[]) => {
+    const prev = list;
+    setList(next);
+    try {
+      await api.setPrefs({ ...status.prefs, sources: next });
+      reload();
+    } catch (e) {
+      setList(prev);
+      toast((e as Error).message);
+    }
+  };
+  const move = (i: number, d: -1 | 1) => {
+    const j = i + d;
+    if (j < 0 || j >= list.length) return;
+    const next = [...list];
+    [next[i], next[j]] = [next[j], next[i]];
+    focusAfter.current = { id: list[i].id, dir: d < 0 ? "up" : "down" };
+    save(next);
+  };
+
+  const folder = useMusicFolder();
+  const states = Object.fromEntries(list.map((p) => [p.id, sourceState(p.id, status, folder)])) as Record<SourceId, { text: string; ready: boolean }>;
+  const anyOn = list.some((p) => p.on);
+  const anyUsable = list.some((p) => p.on && states[p.id].ready);
+  const ytOff = !list.find((p) => p.id === "youtube")?.on;
+
+  return (
+    <Section title="Audio sources" state={anyUsable ? "ok" : "warn"} id="sources">
+      <p className="muted small">
+        For each song the app tries these from top to bottom and plays the first one that has it. YouTube includes the
+        server's MP3 copies of YouTube plays. With YouTube off the app uses only your libraries: no YouTube search, home feed
+        or radio — those come from your libraries instead.
+      </p>
+      <ol className="source-list" ref={listRef}>
+        {list.map((p, i) => {
+          const name = SOURCE_LABELS[p.id];
+          const st = states[p.id];
+          return (
+            <li key={p.id} className={`source-row ${p.on ? "" : "off"}`}>
+              <span className="source-rank" aria-hidden>
+                {i + 1}
+              </span>
+              <div className="source-text">
+                <div className="source-name">{name}</div>
+                <div className={`source-state ${p.on && !st.ready ? "warn-text" : ""}`}>{p.on ? st.text : `Off · ${st.text}`}</div>
+              </div>
+              <div className="source-move">
+                <button
+                  className="icon-btn"
+                  data-move={`${p.id}-up`}
+                  disabled={i === 0}
+                  onClick={() => move(i, -1)}
+                  aria-label={`Move ${name} up`}
+                  title="Move up"
+                >
+                  <ChevronUp size={20} />
+                </button>
+                <button
+                  className="icon-btn"
+                  data-move={`${p.id}-down`}
+                  disabled={i === list.length - 1}
+                  onClick={() => move(i, 1)}
+                  aria-label={`Move ${name} down`}
+                  title="Move down"
+                >
+                  <ChevronDown size={20} />
+                </button>
+              </div>
+              <label className="switch" title={p.on ? `Turn ${name} off` : `Turn ${name} on`}>
+                <input
+                  type="checkbox"
+                  checked={p.on}
+                  aria-label={`Use ${name}`}
+                  onChange={(e) => save(list.map((q) => (q.id === p.id ? { ...q, on: e.target.checked } : q)))}
+                />
+              </label>
+            </li>
+          );
+        })}
+      </ol>
+      {!anyOn ? (
+        <p className="small warn-text">Everything is off, so nothing can play.</p>
+      ) : !anyUsable ? (
+        <p className="small warn-text">None of the sources that are on is set up yet, so nothing can play.</p>
+      ) : ytOff ? (
+        <p className="small muted">YouTube is off: nothing is sent to YouTube, and songs only play when one of your libraries has them.</p>
+      ) : null}
+    </Section>
+  );
+}
+
+function Jellyfin({ status, reload }: { status: Status; reload: () => void }) {
+  const toast = useStore((s) => s.toastMsg);
+  const jf = status.jellyfin;
+  const [form, setForm] = useState({ url: "", username: "", password: "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const connect = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const info = await api.jellyfin.connect(form.url.trim(), form.username.trim(), form.password);
+      setForm({ url: "", username: "", password: "" });
+      toast(`Connected to ${info.serverName ?? "Jellyfin"}`);
+      reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section title="Jellyfin" state={jf?.connected ? "ok" : "off"} id="jellyfin">
+      <p className="muted small">
+        Like Plex: when a song is also in your Jellyfin music library, it can play from there (lossless if your files are).
+      </p>
+      {jf?.connected ? (
+        <div className="row gap wrap">
+          <span className="small">
+            <strong>{jf.serverName ?? "Jellyfin"}</strong>
+            {jf.user ? <> as {jf.user}</> : null}
+            {jf.url ? <span className="muted"> · {jf.url}</span> : null}
+          </span>
+          <button
+            className="btn ghost small danger"
+            onClick={() =>
+              api.jellyfin
+                .disconnect()
+                .then(reload)
+                .catch((e) => toast((e as Error).message))
+            }
+          >
+            Disconnect
+          </button>
+        </div>
+      ) : (
+        <form
+          className="row gap wrap"
+          onSubmit={(e) => {
+            e.preventDefault();
+            connect();
+          }}
+        >
+          <input
+            className="input grow"
+            placeholder="Server URL, e.g. http://192.168.1.10:8096"
+            aria-label="Jellyfin server URL"
+            inputMode="url"
+            autoComplete="url"
+            value={form.url}
+            onChange={(e) => setForm({ ...form, url: e.target.value })}
+          />
+          <input
+            className="input grow"
+            placeholder="Username"
+            aria-label="Jellyfin username"
+            autoComplete="username"
+            value={form.username}
+            onChange={(e) => setForm({ ...form, username: e.target.value })}
+          />
+          <input
+            className="input grow"
+            type="password"
+            placeholder="Password"
+            aria-label="Jellyfin password"
+            autoComplete="current-password"
+            value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })}
+          />
+          <button className="btn" type="submit" disabled={busy || !form.url.trim() || !form.username.trim()}>
+            {busy ? "Connecting…" : "Connect"}
+          </button>
+        </form>
+      )}
+      {error && <p className="error small">{error}</p>}
+      {!jf?.connected && <p className="muted small">The sign-in is stored only on your server.</p>}
+    </Section>
+  );
+}
+
+/** Folders on the server computer whose music files (and subfolders') are indexed and played. */
+/** The music folder on this device: scanned and played by the web app itself. */
+function MusicFolder() {
+  const toast = useStore((s) => s.toastMsg);
+  const f = useMusicFolder();
+  const [busy, setBusy] = useState(false);
+  const run = async (fn: () => Promise<void>, done?: string) => {
+    setBusy(true);
+    try {
+      await fn();
+      if (done) toast(done);
+    } catch (e) {
+      toast((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const last = toSecs(f.lastScanAt);
+
+  return (
+    <Section title="Music folder" state={f.error ? "warn" : f.state === "ready" ? "ok" : f.state === "none" ? "off" : "warn"} id="music-folder">
+      <p className="muted small">
+        A folder of music on this device (this browser): the app reads the files in it and all its subfolders (tags, length,
+        cover art) and keeps the list here. Songs that match play straight from the files. Other devices have their own
+        folder, or none.
+      </p>
+      {!canPickFolder ? (
+        <p className="notice small">This browser can't open folders. Use Chrome or Edge on a computer.</p>
+      ) : (
+        <>
+          {!canKeepFolder && (
+            <p className="muted small">
+              This browser can't keep the folder between visits: pick it again each time (the list of songs is kept). Chrome
+              and Edge on a computer keep it.
+            </p>
+          )}
+          {f.name && (
+            <p className="small">
+              <strong>{f.name}</strong>
+              {f.scanning
+                ? ` · scanning… ${plural(f.scanned, "file")} looked at so far`
+                : ` · ${plural(f.tracks, "track")}${last ? ` · last scanned ${ago(last)}` : ""}`}
+            </p>
+          )}
+          {f.state === "permission" && <p className="notice small">The browser needs your OK to read the folder again.</p>}
+          {f.state === "repick" && <p className="notice small">Pick the folder again to play from it on this visit.</p>}
+          <div className="row gap wrap">
+            {f.state === "permission" && (
+              <button className="btn" disabled={busy} onClick={() => run(reconnectFolder)}>
+                Allow access
+              </button>
+            )}
+            <button
+              className={f.state === "none" || f.state === "repick" ? "btn" : "btn ghost"}
+              disabled={busy || f.scanning}
+              onClick={() => run(pickFolder)}
+            >
+              {f.state === "none" ? "Choose folder…" : f.state === "repick" ? "Pick folder again…" : "Choose another folder…"}
+            </button>
+            {f.state === "ready" && (
+              <button className="btn ghost small" disabled={busy || f.scanning} onClick={() => run(rescanFolder)}>
+                Rescan now
+              </button>
+            )}
+            {f.state !== "none" && (
+              <button
+                className="btn ghost small"
+                disabled={busy || f.scanning}
+                onClick={() =>
+                  confirm("Stop using this folder on this device? Its song list and your picks here are removed (the files stay).") &&
+                  run(forgetFolder, "Music folder removed")
+                }
+              >
+                Remove
+              </button>
+            )}
+          </div>
+        </>
+      )}
+      {f.error && <p className="error small">{f.error}</p>}
+    </Section>
+  );
+}
+
+/** Link to a commit on GitHub. */
+const commitUrl = (hash: string) => `https://github.com/Person1080p/ytplayer/commit/${hash}`;
+
+function BuildLine({ label, commit, dirty, builtAt }: { label: string; commit: string | null; dirty: boolean; builtAt: number | null }) {
+  const at = toSecs(builtAt);
+  return (
+    <div className="small">
+      {label}:{" "}
+      {commit ? (
+        <a href={commitUrl(commit)} target="_blank" rel="noreferrer">
+          <code>{commit.slice(0, 7)}</code>
+        </a>
+      ) : (
+        <span className="muted">unknown</span>
+      )}
+      {dirty && <span className="warn-text"> + local changes</span>}
+      {at ? <span className="muted"> · built {new Date(at * 1000).toLocaleString()}</span> : null}
+    </div>
+  );
+}
+
+/** Which commit the server and this page were built from, and whether they match. */
+function Version({ status }: { status: Status }) {
+  const v = status.version;
+  const server = v?.commit ?? null;
+  const app = APP_COMMIT;
+  const differ = !!server && !!app && server !== app;
+  const serverAt = toSecs(v?.builtAt);
+  const appAt = toSecs(APP_BUILT_AT);
+  const pageOlder = differ && serverAt != null && appAt != null ? appAt < serverAt : null;
+  return (
+    <Section title="Version" state={differ ? "warn" : server || app ? "ok" : undefined} id="version">
+      <BuildLine label="Server" commit={server} dirty={!!v?.dirty} builtAt={v?.builtAt ?? null} />
+      <BuildLine label="This page" commit={app} dirty={APP_DIRTY} builtAt={APP_BUILT_AT} />
+      {differ ? (
+        <p className="small warn-text">
+          {pageOlder === false
+            ? "This page is newer than the server: restart the server with the new build to match."
+            : pageOlder
+              ? "This page is older than the server: refresh the page to load the new version."
+              : "This page and the server were built from different commits: refresh the page."}{" "}
+          {pageOlder !== false && (
+            <button className="link-btn" onClick={() => location.reload()}>
+              Refresh now
+            </button>
+          )}
+        </p>
+      ) : server && app ? (
+        <p className="small muted">The page and the server are the same version.</p>
+      ) : null}
     </Section>
   );
 }
@@ -469,6 +903,23 @@ function Spotify({ status, reload }: { status: Status; reload: () => void }) {
   );
 }
 
+/** Deezer favourites import (Library → Import), hidden unless turned on here. */
+function Deezer({ status, reload }: { status: Status; reload: () => void }) {
+  const on = status.prefs.deezer;
+  return (
+    <Section title="Deezer" state={on ? "ok" : "off"}>
+      <label className="switch block">
+        <input
+          type="checkbox"
+          checked={on}
+          onChange={(e) => api.setPrefs({ ...status.prefs, deezer: e.target.checked }).then(reload)}
+        />
+        <span>Show the Deezer favourites import in Library → Import</span>
+      </label>
+    </Section>
+  );
+}
+
 function ListeningProfile() {
   const p = useProfile();
   const fresh = p.active === "fresh";
@@ -501,6 +952,8 @@ function ListeningProfile() {
 
 function Preferences({ status, reload }: { status: Status; reload: () => void }) {
   const [p, setP] = useState<Prefs>(status.prefs);
+  // Prefs changed elsewhere on the page (Deezer, request log): don't send old values back.
+  useEffect(() => setP(status.prefs), [status.prefs]);
   const update = async (patch: Partial<Prefs>) => {
     const np = { ...p, ...patch };
     setP(np);
@@ -510,17 +963,15 @@ function Preferences({ status, reload }: { status: Status; reload: () => void })
   return (
     <Section title="Playback">
       <label className="switch block">
-        <input type="checkbox" checked={p.preferPlex} onChange={(e) => update({ preferPlex: e.target.checked })} />
-        <span>Prefer Plex when the track is in my library</span>
-      </label>
-      <label className="switch block">
         <input type="checkbox" checked={p.scrobble} onChange={(e) => update({ scrobble: e.target.checked })} />
         <span>Scrobble to Last.fm</span>
       </label>
-      <label className="switch block">
-        <input type="checkbox" checked={p.reportYoutube} onChange={(e) => update({ reportYoutube: e.target.checked })} />
-        <span>Add played tracks to my YouTube watch history (improves YouTube Music recommendations)</span>
-      </label>
+      {youtubeOn(status) && (
+        <label className="switch block">
+          <input type="checkbox" checked={p.reportYoutube} onChange={(e) => update({ reportYoutube: e.target.checked })} />
+          <span>Add played tracks to my YouTube watch history (improves YouTube Music recommendations)</span>
+        </label>
+      )}
       <label className="switch block">
         <input type="checkbox" checked={p.loveOnLastfm} onChange={(e) => update({ loveOnLastfm: e.target.checked })} />
         <span>♥ also loves / un-loves the song on Last.fm</span>
@@ -851,6 +1302,13 @@ function DeviceSection({ status }: { status: Status | null }) {
 function System({ status, reload }: { status: Status; reload: () => void }) {
   const toast = useStore((s) => s.toastMsg);
   const [busy, setBusy] = useState(false);
+  if (!youtubeOn(status)) {
+    return (
+      <Section title="yt-dlp" state="off">
+        <p className="muted small">Not used while YouTube is off in Audio sources.</p>
+      </Section>
+    );
+  }
   return (
     <Section title="yt-dlp" state={status.ytdlp.version ? "ok" : "warn"}>
       <div className="small">
@@ -1037,8 +1495,7 @@ export default function Settings() {
   const [params] = useSearchParams();
   const toast = useStore((s) => s.toastMsg);
   const reload = useRef(() =>
-    api
-      .status()
+    fetchStatus()
       .then((s) => {
         setStatus(s);
         setError(null);
@@ -1075,16 +1532,21 @@ export default function Settings() {
       {ready && error && <p className="error">{error}</p>}
       {ready && status && (
         <>
+          <AudioSources status={status} reload={reload} />
           <YouTubeMusic status={status} reload={reload} />
           <Plex status={status} reload={reload} />
+          <Jellyfin status={status} reload={reload} />
+          <MusicFolder />
           <LastFm status={status} reload={reload} />
           <Spotify status={status} reload={reload} />
+          <Deezer status={status} reload={reload} />
           <ListeningProfile />
           <Preferences status={status} reload={reload} />
           <ServerSection status={status} reload={reload} />
           <DeviceSection status={status} />
           <System status={status} reload={reload} />
           <YouTubeLog status={status} reload={reload} />
+          <Version status={status} />
         </>
       )}
       {!ready && <p className="muted small">Account and playback settings appear here once you're connected to your server.</p>}

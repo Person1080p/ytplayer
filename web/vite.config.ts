@@ -3,6 +3,8 @@ import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const backend = process.env.YTP_BACKEND ?? "http://127.0.0.1:8080";
 
@@ -12,8 +14,30 @@ const tailnetVersion = existsSync(wasmPath)
   ? createHash("sha256").update(readFileSync(wasmPath)).digest("hex").slice(0, 12)
   : "missing";
 
+// The git commit this page is built from, for the version check in Settings. Git may refuse a repo
+// on a network share owned by someone else ("dubious ownership"), hence `safe.directory`; with no
+// git at all the commit is just unknown.
+const here = fileURLToPath(new URL(".", import.meta.url));
+function git(...args: string[]): string | null {
+  for (const pre of [["-c", "safe.directory=*"], []]) {
+    try {
+      return execFileSync("git", [...pre, ...args], { cwd: here, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 20_000 }).trim();
+    } catch {
+      // try the next way, or give up
+    }
+  }
+  return null;
+}
+const commit = process.env.YTP_COMMIT || git("rev-parse", "HEAD") || null;
+const dirty = !process.env.YTP_COMMIT && !!commit && !!git("status", "--porcelain");
+
 export default defineConfig({
-  define: { __TAILNET_VERSION__: JSON.stringify(tailnetVersion) },
+  define: {
+    __TAILNET_VERSION__: JSON.stringify(tailnetVersion),
+    __APP_COMMIT__: JSON.stringify(commit),
+    __APP_DIRTY__: JSON.stringify(dirty),
+    __APP_BUILT_AT__: JSON.stringify(Math.floor(Date.now() / 1000)),
+  },
   plugins: [
     react(),
     VitePWA({

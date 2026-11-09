@@ -1,10 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { api, fmtTime, isPlexId, type ImportJob, type LikedEntry, type Status, type Track } from "../lib/api";
+import {
+  api,
+  fmtTime,
+  isLibraryOnlyId,
+  libraryApi,
+  libraryItem,
+  SOURCE_LABELS,
+  type ImportJob,
+  type LikedEntry,
+  type SourceId,
+  type Status,
+  type Track,
+} from "../lib/api";
+import { fetchStatus, sourceConnected, youtubeOn } from "../lib/serverStatus";
 import { enqueue, playRadio, playTracks } from "../lib/player";
 import { useStore } from "../lib/store";
 import { CloseIcon, MatchIcon, PlayIcon, QueueIcon, ShuffleIcon } from "../components/Icons";
-import { Sheet } from "../components/Sheets";
+import { isLibrarySource, Sheet } from "../components/Sheets";
 import { loadLibraryIds } from "../lib/library";
 import { Cover, TrackRow } from "../components/TrackRow";
 
@@ -46,6 +59,10 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
   const [deezerId, setDeezerId] = useState("");
   const [deezerToken, setDeezerToken] = useState("");
   const [text, setText] = useState("");
+  // A file picked for "Other files" (used instead of the text box while set).
+  const [file, setFile] = useState<File | null>(null);
+  const ready = !!file || !!text.trim();
+  const youtube = youtubeOn(status);
 
   useEffect(() => {
     if (status?.deezer.userId) setDeezerId(status.deezer.userId);
@@ -56,19 +73,32 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
       await p;
       toast(`${label} import started`);
       onStarted();
+      return true;
     } catch (e) {
       toast((e as Error).message);
+      return false;
     }
+  };
+
+  const importOther = (lazy: boolean) => {
+    const label = `${file ? file.name : "Pasted list"}${lazy ? "" : " (complete)"}`;
+    const p = file ? api.library.importFile(file, "file", { lazy }) : api.library.importText(text, { lazy });
+    return run(p, label).then((ok) => {
+      if (!ok) return;
+      setFile(null);
+      setText("");
+    });
   };
 
   return (
     <div className="panel">
       <h2>Import liked tracks</h2>
       <p className="muted small">
-        Tracks from other services are matched to YouTube Music automatically. Plex copies are used for playback when
-        available.
+        {youtube
+          ? "Tracks from other services are matched to YouTube Music automatically. Copies in your libraries (Plex, Jellyfin, music folder) are used for playback when available."
+          : "YouTube is off, so imported songs are matched to your libraries (Plex, Jellyfin, music folder) when they play."}
       </p>
-      {status && (
+      {status && youtube && (
         <label className="field">
           <span className="small muted">
             Matching speed — slower means fewer refusals from YouTube (it pauses and retries when they happen)
@@ -88,15 +118,17 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
         </label>
       )}
 
-      <div className="import-row">
-        <div>
-          <strong>YouTube Music</strong>
-          <div className="muted small">{status?.ytmusic.authenticated ? "Cookie configured" : "Needs cookie in Settings"}</div>
+      {youtube && (
+        <div className="import-row">
+          <div>
+            <strong>YouTube Music</strong>
+            <div className="muted small">{status?.ytmusic.authenticated ? "Cookie configured" : "Needs cookie in Settings"}</div>
+          </div>
+          <button className="btn" disabled={!status?.ytmusic.authenticated} onClick={() => run(api.library.importYtMusic(), "YouTube Music")}>
+            Import
+          </button>
         </div>
-        <button className="btn" disabled={!status?.ytmusic.authenticated} onClick={() => run(api.library.importYtMusic(), "YouTube Music")}>
-          Import
-        </button>
-      </div>
+      )}
 
       <div className="import-row column">
         <div className="row between">
@@ -146,106 +178,130 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
         )}
       </div>
 
-      <div className="import-row column">
-        <div>
-          <strong>Deezer</strong>
-          <div className="muted small">Profile ID or URL (profile must be public, or supply an access token)</div>
+      {status?.prefs.deezer && (
+        <div className="import-row column">
+          <div>
+            <strong>Deezer</strong>
+            <div className="muted small">Profile ID or URL (profile must be public, or supply an access token)</div>
+          </div>
+          <div className="row gap wrap">
+            <input className="input grow" placeholder="e.g. 123456789" value={deezerId} onChange={(e) => setDeezerId(e.target.value)} />
+            <input className="input grow" placeholder="access token (optional)" value={deezerToken} onChange={(e) => setDeezerToken(e.target.value)} />
+            <button className="btn" disabled={!deezerId.trim()} onClick={() => run(api.library.importDeezer(deezerId, deezerToken || undefined), "Deezer")}>
+              Import
+            </button>
+          </div>
         </div>
-        <div className="row gap wrap">
-          <input className="input grow" placeholder="e.g. 123456789" value={deezerId} onChange={(e) => setDeezerId(e.target.value)} />
-          <input className="input grow" placeholder="access token (optional)" value={deezerToken} onChange={(e) => setDeezerToken(e.target.value)} />
-          <button className="btn" disabled={!deezerId.trim()} onClick={() => run(api.library.importDeezer(deezerId, deezerToken || undefined), "Deezer")}>
-            Import
-          </button>
-        </div>
-      </div>
-
-      <div className="import-row">
-        <div>
-          <strong>Demus</strong>
-          <div className="muted small">In Demus, export/share your library or a playlist, save the file, and pick it here.</div>
-        </div>
-        <label className="btn">
-          Choose export…
-          <input
-            type="file"
-            hidden
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              e.target.value = "";
-              if (f) run(api.library.importFile(f, "demus"), "Demus");
-            }}
-          />
-        </label>
-      </div>
+      )}
 
       <div className="import-row column">
         <div>
           <strong>Other files / paste</strong>
           <div className="muted small">
             CSV (Exportify, TuneMyMusic, Soundiiz…), JSON, M3U/M3U8, plist, zip backups, YouTube links — or paste “Artist -
-            Title” lines.
+            Title” lines. For a Spotify playlist, export it as CSV from{" "}
+            <a href="https://exportify.net/" target="_blank" rel="noreferrer">
+              Exportify
+            </a>{" "}
+            or{" "}
+            <a href="https://www.chosic.com/spotify-playlist-exporter/" target="_blank" rel="noreferrer">
+              Chosic's playlist exporter
+            </a>
+            .
           </div>
         </div>
-        <textarea className="input" rows={4} placeholder="Daft Punk - Get Lucky" value={text} onChange={(e) => setText(e.target.value)} />
+        {file ? (
+          <div className="row gap">
+            <span className="grow small">
+              <strong>{file.name}</strong> <span className="muted">· {Math.max(1, Math.round(file.size / 1024))} KB</span>
+            </span>
+            <button className="icon-btn" aria-label="Clear file" title="Use the text box instead" onClick={() => setFile(null)}>
+              <CloseIcon size={18} />
+            </button>
+          </div>
+        ) : (
+          <textarea className="input" rows={4} placeholder="Daft Punk - Get Lucky" value={text} onChange={(e) => setText(e.target.value)} />
+        )}
         <div className="row gap wrap">
           <label className="btn ghost">
-            Upload file…
+            Choose file…
             <input
               type="file"
               hidden
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 e.target.value = "";
-                if (f) run(api.library.importFile(f, "file"), f.name);
+                if (f) setFile(f);
               }}
             />
           </label>
           <button
             className="btn"
-            disabled={!text.trim()}
-            onClick={() => run(api.library.importText(text), "Pasted list").then(() => setText(""))}
+            disabled={!ready}
+            title={youtube ? "Adds the songs right away; each is found on YouTube the first time it plays" : "Adds the songs right away"}
+            onClick={() => importOther(true)}
           >
-            Import pasted
+            Import
           </button>
+          {youtube && (
+            <button
+              className="btn ghost"
+              disabled={!ready}
+              title="Looks up every song on YouTube now (at the matching speed above), so unmatched ones show straight away"
+              onClick={() => importOther(false)}
+            >
+              Complete import
+            </button>
+          )}
         </div>
+        {youtube && (
+          <div className="muted small">
+            Import adds the songs straight away, and each is matched on YouTube the first time it plays. Complete import
+            looks every song up now instead.
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-type MatchSource = "youtube" | "plex";
+const MATCH_TABS: Record<SourceId, string> = { youtube: "YouTube", plex: "Plex", jellyfin: "Jellyfin", local: "Folder" };
 
 /**
- * Pick what a library entry plays: a YouTube track, or a track from the Plex server. A song that
- * has a YouTube match keeps it (for radio and as a fallback) and plays the chosen Plex file; one
- * without becomes a Plex-only song.
+ * Pick what a library entry plays: a YouTube track, or a track from Plex, Jellyfin or the music
+ * folder. A song that already has a match keeps it (for radio and as a fallback) and plays the
+ * chosen library file; one without becomes a song of that library only.
  */
 function MatchSheet({
   entry,
-  plexConnected,
+  status,
   onClose,
   onDone,
 }: {
   entry: LikedEntry;
-  plexConnected: boolean;
+  status: Status | null;
   onClose: () => void;
   onDone: () => void;
 }) {
   const toast = useStore((s) => s.toastMsg);
   const initial = `${entry.artist} ${entry.title}`;
-  const [source, setSource] = useState<MatchSource>("youtube");
+  // YouTube (while it's on) and each library that's set up, in priority order.
+  const order = status?.prefs.sources?.map((p) => p.id) ?? (["plex", "jellyfin", "local", "youtube"] as SourceId[]);
+  const tabs = order.filter((id) => (id === "youtube" ? youtubeOn(status) : sourceConnected(status, id)));
+  const [picked, setSource] = useState<SourceId | null>(null);
+  const source: SourceId | undefined = picked && tabs.includes(picked) ? picked : tabs.includes("youtube") ? "youtube" : tabs[0];
   const [q, setQ] = useState(initial);
   const [results, setResults] = useState<Track[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // A YouTube match to keep when a Plex track is chosen.
-  const youtubeMatch = entry.track && !isPlexId(entry.track.videoId) ? entry.track : null;
+  // A match to keep when a library track is chosen (a YouTube song, or one matched when it plays).
+  const keep = entry.track && !isLibraryOnlyId(entry.track.videoId) ? entry.track : null;
 
-  const search = useCallback(async (from: MatchSource, query: string) => {
+  const search = useCallback(async (from: SourceId | undefined, query: string) => {
+    if (!from) return;
     setResults(null);
     setError(null);
     try {
-      setResults(from === "plex" ? await api.plexSearch(query) : await api.search(query));
+      setResults(from === "youtube" ? await api.search(query) : await libraryApi(from).search(query));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -255,23 +311,24 @@ function MatchSheet({
     search(source, q);
   }, [entry, source, search]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const switchTo = (s: MatchSource) => {
-    // Plex's search matches titles best; YouTube's does better with the artist too.
-    if (s === "plex" && q === initial) setQ(entry.title);
+  const switchTo = (s: SourceId) => {
+    // Library searches match titles best; YouTube's does better with the artist too.
+    if (s !== "youtube" && q === initial) setQ(entry.title);
     if (s === "youtube" && q === entry.title) setQ(initial);
     setSource(s);
   };
 
   const use = async (t: Track) => {
+    const item = libraryItem(t.videoId);
     try {
-      if (isPlexId(t.videoId) && youtubeMatch) {
-        await api.plexSetMatch(youtubeMatch.videoId, t.videoId.slice("plex_".length));
-        toast(`“${entry.title}” will play from Plex`);
+      if (item && keep) {
+        await libraryApi(item.source).setMatch(keep.videoId, item.itemId);
+        toast(`“${entry.title}” will play from ${SOURCE_LABELS[item.source]}`);
         onDone();
         return;
       }
       await api.library.match(entry.id, t);
-      toast(isPlexId(t.videoId) ? `Matched to “${t.title}” in Plex` : `Matched to “${t.title}”`);
+      toast(item ? `Matched to “${t.title}” in ${SOURCE_LABELS[item.source]}` : `Matched to “${t.title}”`);
       loadLibraryIds();
       onDone();
     } catch (e) {
@@ -280,6 +337,7 @@ function MatchSheet({
   };
 
   const isCurrent = (t: Track) => entry.track?.videoId === t.videoId;
+  const libName = isLibrarySource(source) ? SOURCE_LABELS[source] : "";
 
   return (
     <Sheet onClose={onClose}>
@@ -288,45 +346,52 @@ function MatchSheet({
         For <strong>{entry.title}</strong> by {entry.artist}
         {entry.album ? ` · ${entry.album}` : ""} ({PROVIDERS[entry.provider] ?? entry.provider})
       </p>
-      {plexConnected && (
+      {tabs.length > 1 && (
         <div className="tabs" role="tablist" style={{ margin: "0 8px 10px" }}>
-          {(["youtube", "plex"] as const).map((s) => (
+          {tabs.map((s) => (
             <button key={s} role="tab" aria-selected={source === s} className={source === s ? "on" : ""} onClick={() => switchTo(s)}>
-              {s === "youtube" ? "YouTube" : "Plex"}
+              {MATCH_TABS[s]}
             </button>
           ))}
         </div>
       )}
-      {source === "plex" && (
+      {!source && (
         <p className="small muted" style={{ margin: "0 8px 10px" }}>
-          {youtubeMatch
-            ? "Plays the Plex file you pick. The YouTube match stays for radio, and is used when Plex is unavailable or “Prefer Plex” is off in Settings."
-            : "Adds the song from your Plex library. It only plays while the Plex server is reachable."}
+          Turn on YouTube or connect a library (Plex, Jellyfin or a music folder) in Settings → Audio sources to find a match.
         </p>
       )}
-      <form
-        className="row gap"
-        onSubmit={(e) => {
-          e.preventDefault();
-          search(source, q);
-        }}
-      >
-        <input className="input" value={q} onChange={(e) => setQ(e.target.value)} />
-        <button className="btn" type="submit">
-          Search
-        </button>
-      </form>
+      {libName && (
+        <p className="small muted" style={{ margin: "0 8px 10px" }}>
+          {keep
+            ? `Plays the ${libName} file you pick, in the order set in Settings → Audio sources. The current match stays for radio and as a fallback.`
+            : `Adds the song from ${libName}. It only plays while ${libName} is reachable.`}
+        </p>
+      )}
+      {source && (
+        <form
+          className="row gap"
+          onSubmit={(e) => {
+            e.preventDefault();
+            search(source, q);
+          }}
+        >
+          <input className="input" value={q} onChange={(e) => setQ(e.target.value)} aria-label={`Search ${MATCH_TABS[source]}`} />
+          <button className="btn" type="submit">
+            Search
+          </button>
+        </form>
+      )}
       {error && <p className="error small">{error}</p>}
-      {!results && !error && <div className="spinner" />}
+      {source && !results && !error && <div className="spinner" />}
       <div className="sheet-list">
         {results?.map((t) => (
           <div key={t.videoId} className={`match-row ${isCurrent(t) ? "current" : ""}`}>
             <button
               className="track-main"
-              onClick={() => (isPlexId(t.videoId) ? playTracks([t]) : playRadio(t))}
+              onClick={() => (isLibraryOnlyId(t.videoId) ? playTracks([t]) : playRadio(t))}
               title="Preview"
             >
-              <Cover src={t.thumbnail} size={44} />
+              <Cover src={t.thumbnail} size={44} videoId={t.videoId} />
               <div className="track-text">
                 <div className="track-title">{t.title}</div>
                 <div className="track-sub">
@@ -346,7 +411,7 @@ function MatchSheet({
         ))}
         {results?.length === 0 && (
           <p className="muted small">
-            {source === "plex" ? "Nothing in Plex for that — try a shorter search (just the title)." : "No results — try a different search."}
+            {libName ? `Nothing in ${libName} for that — try a shorter search (just the title).` : "No results — try a different search."}
           </p>
         )}
       </div>
@@ -375,7 +440,7 @@ export default function Library() {
     api.library.jobs().then(setJobs).catch(() => {});
   }, [provider, q, onlyUnmatched]);
 
-  const loadStatus = useCallback(() => api.status().then(setStatus).catch(() => {}), []);
+  const loadStatus = useCallback(() => fetchStatus().then(setStatus).catch(() => {}), []);
 
   useEffect(() => {
     const t = setTimeout(load, 200);
@@ -490,9 +555,18 @@ export default function Library() {
               onPlay={() => playTracks(playable, playable.indexOf(l.track!))}
               trailing={
                 <>
-                  <span className="provider-tag" title={l.status === "manual" ? "Matched by you" : undefined}>
+                  <span
+                    className="provider-tag"
+                    title={
+                      l.status === "manual"
+                        ? "Matched by you"
+                        : l.status === "deferred"
+                          ? "Found on YouTube the first time it plays"
+                          : undefined
+                    }
+                  >
                     {PROVIDERS[l.provider] ?? l.provider}
-                    {l.status === "manual" ? " · ✓" : ""}
+                    {l.status === "manual" ? " · ✓" : l.status === "deferred" ? " · on play" : ""}
                   </span>
                   <button className="icon-btn" aria-label="Change match" title="Change match" onClick={() => setMatching(l)}>
                     <MatchIcon size={18} />
@@ -526,7 +600,7 @@ export default function Library() {
       {matching && (
         <MatchSheet
           entry={matching}
-          plexConnected={!!status?.plex.connected}
+          status={status}
           onClose={() => setMatching(null)}
           onDone={() => {
             setMatching(null);

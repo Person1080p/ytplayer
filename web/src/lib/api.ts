@@ -52,7 +52,8 @@ export type LikedEntry = {
   title: string;
   artist: string;
   album?: string | null;
-  status: "matched" | "unmatched" | "error" | "manual";
+  /** "deferred": added without a lookup; matched on YouTube when it first plays. */
+  status: "matched" | "unmatched" | "error" | "manual" | "deferred";
   track?: Track | null;
 };
 
@@ -69,8 +70,27 @@ export type ImportJob = {
   finishedAt?: number | null;
 };
 
-/** Where a track's audio comes from: the Plex library, a recent MP3 copy kept by the server, or YouTube. */
-export type AudioSource = "plex" | "cache" | "youtube";
+/**
+ * Where a track's audio comes from: the Plex or Jellyfin library, the server's music folder, a
+ * recent MP3 copy of a YouTube play kept by the server, or YouTube.
+ */
+export type AudioSource = "plex" | "jellyfin" | "local" | "cache" | "youtube";
+
+/** The audio sources in Settings → Audio sources (YouTube includes the server's MP3 copies). */
+export type SourceId = "plex" | "jellyfin" | "local" | "youtube";
+/** Sources with their own music library (everything but YouTube). */
+export type LibrarySourceId = Exclude<SourceId, "youtube">;
+/** One entry of the priority list: tried top to bottom, skipped when off. */
+export type SourcePref = { id: SourceId; on: boolean };
+
+/** Plain names for sources, as shown in the app. */
+export const SOURCE_LABELS: Record<AudioSource, string> = {
+  plex: "Plex",
+  jellyfin: "Jellyfin",
+  local: "Music folder",
+  cache: "Cached",
+  youtube: "YouTube",
+};
 
 /** How a song's Plex copy is chosen: automatically, picked by you, or never from Plex. */
 export type PlexChoice = {
@@ -81,12 +101,34 @@ export type PlexChoice = {
   candidates: { track: Track; score: number; live: boolean }[];
 };
 
+/** Same as `PlexChoice`, for any library source; `current` is the item id (see `libraryItem`). */
+export type LibraryChoice = {
+  mode: "auto" | "picked" | "off";
+  current?: string | null;
+  candidates: { track: Track; score: number; live: boolean }[];
+};
+
+/** What `/tracks/{id}/source` says a song plays from now. */
+export type SourceInfo = {
+  source: AudioSource;
+  kbps?: number | null;
+  /** The library track it plays from (Plex, Jellyfin or the music folder), when it's one. */
+  item?: { source: LibrarySourceId; itemId: string; title: string; artist: string } | null;
+};
+
+/** A Jellyfin server connection (`/status` and `PUT /jellyfin/server`). */
+export type JellyfinInfo = { connected: boolean; url?: string | null; serverName?: string | null; user?: string | null };
+
+/** The git commit a build was made from. */
+export type BuildVersion = { commit: string | null; commitShort: string | null; dirty: boolean; builtAt: number | null };
+
 export type HistoryEntry = { playedAt: number; source: string; scrobbled: boolean; track: Track };
 
 export type ProfileInfo = { active: "main" | "fresh"; freshPlays: number; freshStartedAt?: number | null };
 
 export type Prefs = {
-  preferPlex: boolean;
+  /** All four audio sources, in priority order. */
+  sources: SourcePref[];
   scrobble: boolean;
   reportYoutube: boolean;
   loveOnLastfm: boolean;
@@ -98,6 +140,8 @@ export type Prefs = {
   /** Hours the server keeps and plays MP3 copies of fully loaded YouTube tracks (0: off). */
   /** Hours to keep cached MP3s: 0 is off, -1 is forever. */
   audioCacheHours: number;
+  /** Show the Deezer favourites import in Library → Import. */
+  deezer: boolean;
 };
 
 export type YtLogEntry = {
@@ -166,7 +210,11 @@ export type Status = {
     /** Since when (unix seconds) YouTube treats the saved sign-in as signed out: it expired. */
     expiredSince?: number | null;
   };
-  plex: { connected: boolean; url?: string | null; loggedIn: boolean };
+  /** `enabled`: connected and on in Audio sources. */
+  plex: { connected: boolean; url?: string | null; loggedIn: boolean; enabled?: boolean };
+  jellyfin: JellyfinInfo;
+  /** The server binary's git commit at build time. */
+  version?: BuildVersion | null;
   lastfm: { configured: boolean; keysFromEnv: boolean; connected: boolean; username?: string | null };
   /** Spotify playlists: where playlist exports (CSV) are picked up from. */
   spotify: { exportDirs?: string[]; exportDirSet?: boolean };
@@ -218,6 +266,21 @@ const enc = encodeURIComponent;
 
 /** Songs that are only in Plex use `plex_<ratingKey>` in place of a YouTube video id. */
 export const isPlexId = (videoId: string) => /^plex_\d+$/.test(videoId);
+/** Songs that are only in Jellyfin: `jf_<item id>`. */
+export const isJellyfinId = (videoId: string) => /^jf_[0-9a-f]{32}$/.test(videoId);
+/** Songs found in the music folder on a device (`local_<16 hex>`, from their artist and title).
+ *  Elsewhere they play like imported songs (matched by their tags). */
+export const isLocalId = (videoId: string) => /^local_[0-9a-f]{16}$/.test(videoId);
+/** Songs that only exist in one of the server's libraries (no YouTube video to fall back on). */
+export const isLibraryOnlyId = (videoId: string) => isPlexId(videoId) || isJellyfinId(videoId);
+
+/** The library and item id behind a library-only song id (`plex_1` → plex, "1"), or null. */
+export function libraryItem(videoId: string): { source: LibrarySourceId; itemId: string } | null {
+  if (isPlexId(videoId)) return { source: "plex", itemId: videoId.slice("plex_".length) };
+  if (isJellyfinId(videoId)) return { source: "jellyfin", itemId: videoId.slice("jf_".length) };
+  if (isLocalId(videoId)) return { source: "local", itemId: videoId.slice("local_".length) };
+  return null;
+}
 
 export type SearchResults = {
   top: HomeItem | null;
@@ -226,7 +289,7 @@ export type SearchResults = {
   albums: HomeItem[];
   playlists: HomeItem[];
   videos: Track[];
-  /** YouTube's search failed (this says why): the songs are from Plex and the audio cache. */
+  /** YouTube's search failed (this says why): the songs are from your libraries and the audio cache. */
   fallback?: string;
 };
 export type SearchFilter = "songs" | "artists" | "albums";
@@ -239,10 +302,14 @@ export type SearchFilter = "songs" | "artists" | "albums";
  * The YouTube video a song plays from. `self`: a YouTube song's own video; `picked`: another video
  * picked for a YouTube song; `matched`: a song from elsewhere (Spotify) matched to a video.
  */
-export type YoutubeMatch = { kind: "self" | "picked" | "matched" | "none" | "unknown" | "plex"; track?: Track | null; missing: boolean };
+export type YoutubeMatch = { kind: "self" | "picked" | "matched" | "none" | "unknown" | "plex" | "library"; track?: Track | null; missing: boolean };
 
 /** Songs from other services (Spotify) are queued under their own ids and matched when they play. */
 export const isSpotifyId = (videoId: string) => /^spotify_[A-Za-z0-9]{22}$/.test(videoId);
+/** A song added by a library import without looking it up (matched on YouTube when it plays). */
+export const isSongId = (videoId: string) => /^song_[0-9a-f]{16}$/.test(videoId);
+/** No YouTube video of its own (Spotify playlist songs, imported songs): matched when played. */
+export const isDeferredId = (videoId: string) => isSpotifyId(videoId) || isSongId(videoId);
 export type BrowseRef = { browseId: string; params?: string | null };
 export type ArtistShelf = { title: string; items: HomeItem[]; more?: BrowseRef | null };
 export type ArtistPage = {
@@ -285,8 +352,9 @@ export const api = {
   playlistInfo: (id: string) =>
     req<{ title?: string | null; artist?: string | null; thumbnail?: string | null }>(`/playlist/${enc(id)}/info`),
   recommendations: (videoId: string) => req<Track[]>(`/recommendations/${enc(videoId)}`),
-  source: (videoId: string) =>
-    req<{ source: AudioSource; kbps?: number | null }>(withArgs(`/tracks/${enc(videoId)}/source`, qualityArgs())),
+  /** `only`: just these sources (the web app asks about the ones ahead of its music folder). */
+  source: (videoId: string, opts: { only?: SourceId[] } = {}) =>
+    req<SourceInfo>(withArgs(`/tracks/${enc(videoId)}/source`, [...qualityArgs(), ...(opts.only ? [`only=${opts.only.join(",")}`] : [])])),
   liked: (videoId: string) => req<LikedState>(`/tracks/${enc(videoId)}/liked`),
   setLiked: (track: Track, liked: boolean) =>
     req<LikedState>(`/tracks/${enc(track.videoId)}/liked`, { method: "PUT", body: { track, liked } }),
@@ -350,12 +418,17 @@ export const api = {
     importLastfm: () => req<{ jobId: number }>("/import/lastfm", { method: "POST" }),
     syncLastfm: () => req<{ jobId: number }>("/library/sync-lastfm", { method: "POST" }),
     importYtMusic: () => req<{ jobId: number }>("/import/ytmusic", { method: "POST" }),
-    importFile: (file: File, provider: string) =>
-      req<{ jobId: number }>(`/import/file?provider=${enc(provider)}&name=${enc(file.name)}`, { raw: file }),
+    /** `lazy`: songs are matched on YouTube when they first play, not all looked up now. */
+    importFile: (file: File, provider: string, opts: { lazy?: boolean } = {}) =>
+      req<{ jobId: number }>(
+        `/import/file?provider=${enc(provider)}&name=${enc(file.name)}${opts.lazy ? "&lazy=true" : ""}`,
+        { raw: file },
+      ),
     importDeezer: (userId: string, accessToken?: string) =>
       req<{ jobId: number }>("/import/deezer", { body: { userId, accessToken } }),
-    importText: (content: string, provider?: string) =>
-      req<{ jobId: number }>("/import/text", { body: { content, provider } }),
+    /** `lazy`: songs are matched on YouTube when they first play, not all looked up now. */
+    importText: (content: string, opts: { provider?: string; lazy?: boolean } = {}) =>
+      req<{ jobId: number }>("/import/text", { body: { content, provider: opts.provider, lazy: !!opts.lazy } }),
   },
 
   profile: {
@@ -399,6 +472,24 @@ export const api = {
   /** `off`: never play this song from Plex; `auto`: back to automatic matching. */
   plexClearMatch: (videoId: string, mode: "off" | "auto") =>
     req<{ ok: boolean }>(`/plex/matches/${enc(videoId)}?mode=${mode}`, { method: "DELETE" }),
+
+  jellyfin: {
+    connect: (url: string, username: string, password: string) =>
+      req<JellyfinInfo>("/jellyfin/server", { method: "PUT", body: { url, username, password } }),
+    disconnect: () => req<{ ok: boolean }>("/jellyfin", { method: "DELETE" }),
+    /** Jellyfin tracks as songs; their ids are `jf_<item id>`. */
+    search: (q: string) => req<Track[]>(`/jellyfin/search?q=${enc(q)}`),
+    match: (videoId: string) => req<LibraryChoice>(`/jellyfin/matches/${enc(videoId)}`),
+    setMatch: (videoId: string, itemId: string) =>
+      req<unknown>(`/jellyfin/matches/${enc(videoId)}`, { method: "PUT", body: { itemId } }),
+    clearMatch: (videoId: string, mode: "off" | "auto") =>
+      req<{ ok: boolean }>(`/jellyfin/matches/${enc(videoId)}?mode=${mode}`, { method: "DELETE" }),
+  },
+
+
+  /** Songs from every server library that's on (Plex, Jellyfin; not this device's folder). */
+  librarySearch: (q: string) => req<Track[]>(`/sources/search?q=${enc(q)}`),
+
   /** Which YouTube video a song from another service (Spotify) plays from. */
   youtubeMatch: (videoId: string) => req<YoutubeMatch>(`/tracks/${enc(videoId)}/youtube`),
   /** Play that song from this YouTube video (a song or video from YouTube search). */
@@ -411,6 +502,30 @@ export const api = {
   authCheck: () => req<{ authenticated: boolean; required: boolean }>("/auth/check"),
   login: (token: string) => req<{ ok: boolean }>("/auth/login", { body: { token } }),
 };
+
+/** Matching calls for one library source (Plex keeps its own endpoints). */
+export type LibraryApi = {
+  search: (q: string) => Promise<Track[]>;
+  match: (videoId: string) => Promise<LibraryChoice>;
+  setMatch: (videoId: string, itemId: string) => Promise<unknown>;
+  clearMatch: (videoId: string, mode: "off" | "auto") => Promise<{ ok: boolean }>;
+};
+
+/** The music folder on this device (lib/localFolder.ts registers it; kept out of this module so
+ *  the two don't import each other). */
+let localLibrary: LibraryApi | null = null;
+export function registerLocalLibrary(a: LibraryApi) {
+  localLibrary = a;
+}
+
+export function libraryApi(source: LibrarySourceId): LibraryApi {
+  if (source === "local") {
+    if (!localLibrary) throw new Error("The music folder isn't available in this browser");
+    return localLibrary;
+  }
+  if (source !== "plex") return api[source];
+  return { search: api.plexSearch, match: api.plexMatch, setMatch: api.plexSetMatch, clearMatch: api.plexClearMatch };
+}
 
 /** Raw audio response for a track (used when audio can't be loaded by URL, i.e. over the in-page tailnet). */
 function withArgs(path: string, args: string[]) {

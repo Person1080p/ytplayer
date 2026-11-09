@@ -10,6 +10,7 @@ import {
 } from "../lib/api";
 import { enqueue, playTracks } from "../lib/player";
 import { useStore } from "../lib/store";
+import { useYoutubeOn } from "../lib/serverStatus";
 import {
   BackIcon,
   CloseIcon,
@@ -29,6 +30,8 @@ export function PlaylistsPage() {
   const [name, setName] = useState("");
   const queue = useStore((s) => s.queue);
   const toast = useStore((s) => s.toastMsg);
+  // Linked playlists open from YouTube Music, so they're hidden while YouTube is off.
+  const youtube = useYoutubeOn();
   const load = () => {
     api.playlists.list().then(setLists).catch((e) => toast(e.message));
     api.playlists.linked().then(setLinked).catch(() => {});
@@ -81,7 +84,13 @@ export function PlaylistsPage() {
       </div>
       {lists?.length === 0 && <p className="muted">No playlists yet. Use ⋯ → “Add to playlist” on any track.</p>}
 
-      {linked.length > 0 && (
+      {!youtube && linked.length > 0 && (
+        <p className="small muted">
+          Your {linked.length} linked YouTube Music playlist{linked.length === 1 ? " is" : "s are"} hidden while YouTube is off
+          (Settings → Audio sources).
+        </p>
+      )}
+      {youtube && linked.length > 0 && (
         <section className="shelf">
           <div className="shelf-head">
             <h2>From YouTube Music</h2>
@@ -103,7 +112,7 @@ export function PlaylistsPage() {
           </div>
         </section>
       )}
-      {lists && linked.length === 0 && (
+      {lists && linked.length === 0 && youtube && (
         <p className="small muted">Open a playlist or album from Home or Search and use “Link in Playlists” to keep it here.</p>
       )}
 

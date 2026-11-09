@@ -15,7 +15,6 @@ use serde_json::Value;
 
 use crate::{
     models::{now, Track},
-    services::resolver,
     state::AppState,
 };
 
@@ -674,14 +673,6 @@ pub async fn remove(st: &AppState, id: &str) -> anyhow::Result<()> {
 }
 
 // ---- playing --------------------------------------------------------------------------
-
-/// The YouTube video a Spotify song plays from: matched by title, artist and length the first
-/// time it's needed (when it plays, or radio starts from it), then remembered. None when YouTube
-/// has nothing convincing.
-pub async fn youtube_id(st: &AppState, video_id: &str) -> anyhow::Result<Option<String>> {
-    let t = st.db.get_track(video_id).await?.context("unknown Spotify song")?;
-    Ok(resolver::resolve(&st.yt, &st.db, &t.artist, &t.title, t.duration).await?.map(|t| t.video_id))
-}
 
 #[cfg(test)]
 mod tests {

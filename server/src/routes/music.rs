@@ -10,11 +10,21 @@ use crate::{
     error::{ApiResult, AppError},
     models::{ArtistPage, GridPage, SearchResults, Shelf, Track},
     services::{
-        matching, plex, recommend, spotify,
+        jellyfin, matching, plex, recommend, resolver,
+        sources::{self, YOUTUBE_OFF},
         ytmusic::{HeaderInfo, HomePage, TrackPage},
     },
     state::SharedState,
 };
+
+/// For endpoints that only YouTube can answer (artist pages, YouTube playlists, podcasts…).
+async fn require_youtube(st: &SharedState) -> Result<(), AppError> {
+    if sources::youtube_enabled(&st.db).await {
+        Ok(())
+    } else {
+        Err(AppError::NotConfigured(YOUTUBE_OFF.into()))
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +42,10 @@ pub struct RefreshQuery {
 }
 
 pub async fn home(State(st): State<SharedState>, Query(q): Query<RefreshQuery>) -> ApiResult<HomeResponse> {
+    if !sources::youtube_enabled(&st.db).await {
+        // Built from history, the library and the library sources: nothing to page through.
+        return Ok(Json(HomeResponse { shelves: recommend::library_home(&st).await?, continuation: None }));
+    }
     home_response(&st, st.yt.home(q.refresh.is_some()).await?).await
 }
 
@@ -45,6 +59,9 @@ pub async fn home_more(State(st): State<SharedState>, Query(q): Query<MoreQuery>
     if !q.token.contains('|') || q.token.len() > 8192 {
         return Err(AppError::bad("invalid token"));
     }
+    if !sources::youtube_enabled(&st.db).await {
+        return Ok(Json(HomeResponse { shelves: Vec::new(), continuation: None }));
+    }
     home_response(&st, st.yt.home_more(&q.token).await?).await
 }
 
@@ -55,6 +72,7 @@ async fn home_response(st: &SharedState, page: HomePage) -> ApiResult<HomeRespon
 }
 
 pub async fn discover(State(st): State<SharedState>) -> ApiResult<HomeResponse> {
+    require_youtube(&st).await?;
     Ok(Json(HomeResponse { shelves: recommend::discover(&st).await?, continuation: None }))
 }
 
@@ -69,18 +87,28 @@ pub async fn search(State(st): State<SharedState>, Query(q): Query<SearchQuery>)
     if q.q.trim().is_empty() {
         return Ok(Json(vec![]));
     }
+    if !sources::youtube_enabled(&st.db).await {
+        return Ok(Json(sources::search_library(&st, &q.q, q.limit.unwrap_or(30)).await));
+    }
     let tracks = st.yt.search_songs(&q.q, q.limit.unwrap_or(30)).await?;
     st.db.upsert_tracks(tracks.clone()).await?;
     Ok(Json(tracks))
 }
 
 pub async fn radio(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<Vec<Track>> {
-    if !plex::is_plex_id(&video_id) && !spotify::is_spotify_id(&video_id) {
+    if !sources::youtube_enabled(&st.db).await {
+        // From the library sources, led by the song itself.
+        let seed = track_or_fetch(&st, &video_id).await?;
+        let mut tracks = recommend::library_for_track(&st, &seed, 50, &HashSet::new()).await?;
+        tracks.insert(0, seed);
+        return Ok(Json(tracks));
+    }
+    if !sources::is_library_id(&video_id) && !resolver::is_deferred_id(&video_id) {
         let tracks = st.yt.watch_playlist(Some(&video_id), None, 50).await?;
         st.db.upsert_tracks(tracks.clone()).await?;
         return Ok(Json(tracks));
     }
-    // A Plex-only or Spotify song: radio from its YouTube equivalent, led by the song itself.
+    // A library-only, Spotify or imported song: radio from its YouTube equivalent, led by the song itself.
     let seed = track_or_fetch(&st, &video_id).await?;
     let Some(id) = recommend::youtube_seed(&st, &seed).await else { return Ok(Json(vec![seed])) };
     let mut tracks = st.yt.watch_playlist(Some(&id), None, 50).await?;
@@ -91,6 +119,7 @@ pub async fn radio(State(st): State<SharedState>, Path(video_id): Path<String>) 
 }
 
 pub async fn playlist(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<Vec<Track>> {
+    require_youtube(&st).await?;
     // A podcast: just its newest episodes (one YouTube call); its page loads more as you scroll.
     let tracks = if id.starts_with("MPSP") {
         st.yt.podcast_episodes(&id).await?.tracks
@@ -104,6 +133,7 @@ pub async fn playlist(State(st): State<SharedState>, Path(id): Path<String>) -> 
 /// A podcast's newest episodes and the token for more: one YouTube call per page.
 pub async fn podcast(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<TrackPage> {
     valid_browse_id(&id)?;
+    require_youtube(&st).await?;
     let page = st.yt.podcast_episodes(&id).await?;
     st.db.upsert_tracks(page.tracks.clone()).await?;
     Ok(Json(page))
@@ -114,6 +144,7 @@ pub async fn podcast_more(State(st): State<SharedState>, Query(q): Query<MoreQue
     if q.token.is_empty() || q.token.len() > 8192 {
         return Err(AppError::bad("invalid token"));
     }
+    require_youtube(&st).await?;
     let page = st.yt.episodes_more(&q.token).await?;
     st.db.upsert_tracks(page.tracks.clone()).await?;
     Ok(Json(page))
@@ -122,6 +153,7 @@ pub async fn podcast_more(State(st): State<SharedState>, Query(q): Query<MoreQue
 /// A playlist's or album's name, owner/artist and cover.
 pub async fn playlist_info(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<HeaderInfo> {
     valid_browse_id(&id)?;
+    require_youtube(&st).await?;
     Ok(Json(st.yt.playlist_info(&id).await?))
 }
 
@@ -150,13 +182,21 @@ pub async fn track_or_fetch(st: &SharedState, video_id: &str) -> Result<Track, A
     if let Some(t) = st.db.get_track(video_id).await? {
         return Ok(t);
     }
-    // Spotify songs are stored when their playlist is imported; there's nothing to ask YouTube.
-    if spotify::is_spotify_id(video_id) {
+    // Spotify and imported songs are stored when imported; there's nothing to ask YouTube.
+    if resolver::is_deferred_id(video_id) {
         return Err(AppError::NotFound);
     }
-    let t = match plex::rating_key(video_id) {
-        Some(rk) => st.plex.track_by_key(rk).await?.ok_or(AppError::NotFound)?.to_track(),
-        None => st.yt.song_info(video_id).await?,
+    // A library that isn't connected (any more) can't say what its song is.
+    let unreachable = |e: anyhow::Error| AppError::NotConfigured(format!("{e:#}"));
+    let t = if let Some(rk) = plex::rating_key(video_id) {
+        st.plex.track_by_key(rk).await.map_err(unreachable)?.ok_or(AppError::NotFound)?.to_track()
+    } else if let Some(item) = jellyfin::item_id(video_id) {
+        st.jellyfin.track_by_id(item).await.map_err(unreachable)?.ok_or(AppError::NotFound)?.to_track()
+    } else if sources::youtube_enabled(&st.db).await {
+        st.yt.song_info(video_id).await?
+    } else {
+        // An unknown YouTube video, with YouTube off.
+        return Err(AppError::NotFound);
     };
     st.db.upsert_tracks(vec![t.clone()]).await?;
     Ok(t)
@@ -216,6 +256,14 @@ pub async fn search_all(State(st): State<SharedState>, Query(q): Query<SearchAll
     if q.q.trim().is_empty() {
         return Ok(Json(SearchResults::default()));
     }
+    if !sources::youtube_enabled(&st.db).await {
+        // Songs only: the libraries have no artist or album pages.
+        let songs = match q.filter.as_deref() {
+            None | Some("songs") => sources::search_library(&st, &q.q, 50).await,
+            _ => Vec::new(),
+        };
+        return Ok(Json(SearchResults { songs, ..Default::default() }));
+    }
     let res = match q.filter.as_deref() {
         Some("songs") => st.yt.search_songs(&q.q, 30).await.map(|songs| SearchResults { songs, ..Default::default() }),
         f => st.yt.search_all(&q.q, f).await,
@@ -223,7 +271,7 @@ pub async fn search_all(State(st): State<SharedState>, Query(q): Query<SearchAll
     let res = match res {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("youtube search failed, searching plex and the audio cache: {e:#}");
+            tracing::warn!("youtube search failed, searching the libraries and the audio cache: {e:#}");
             return Ok(Json(offline_search(&st, &q.q, &format!("{e:#}")).await));
         }
     };
@@ -233,7 +281,8 @@ pub async fn search_all(State(st): State<SharedState>, Query(q): Query<SearchAll
     Ok(Json(res))
 }
 
-/// Songs that play without YouTube: Plex tracks, and songs with an MP3 in the audio cache.
+/// Songs that play without YouTube: from the library sources, and songs with an MP3 in the
+/// audio cache.
 async fn offline_search(st: &SharedState, query: &str, error: &str) -> SearchResults {
     let words: Vec<String> = matching::normalize(query).split_whitespace().map(String::from).collect();
     let matches = |t: &Track| {
@@ -241,33 +290,15 @@ async fn offline_search(st: &SharedState, query: &str, error: &str) -> SearchRes
         words.iter().all(|w| hay.contains(w.as_str()))
     };
 
-    let mut songs = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    if st.plex.server().await.is_some() {
-        match st.plex.search(query).await {
-            Ok(hits) => {
-                // Plex's search is loose (it matches on parts of words and on other fields); keep
-                // what contains every word typed, like the cache results.
-                for h in hits {
-                    let t = h.to_track();
-                    let with_album_artist = Track { artist: format!("{} {}", t.artist, h.album_artist), ..t.clone() };
-                    if matches(&with_album_artist) {
-                        seen.insert(format!("{}|{}", matching::normalize(&t.artist), matching::normalize(&t.title)));
-                        songs.push(t);
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("plex search failed too: {e:#}"),
-        }
-    }
+    let mut songs = sources::search_library(st, query, 50).await;
+    let mut seen: HashSet<String> = songs.iter().map(sources::name_key).collect();
     for vid in st.audio_cache.fresh_ids() {
         let Ok(Some(t)) = st.db.get_track(&vid).await else { continue };
-        // Plex has it already: Plex plays better.
-        if matches(&t) && seen.insert(format!("{}|{}", matching::normalize(&t.artist), matching::normalize(&t.title))) {
+        // A library has it already: the library plays better.
+        if matches(&t) && seen.insert(sources::name_key(&t)) {
             songs.push(t);
         }
     }
-    let _ = st.db.upsert_tracks(songs.clone()).await;
     let brief = error.lines().next().unwrap_or(error).chars().take(160).collect::<String>();
     SearchResults { songs, fallback: Some(brief), ..Default::default() }
 }
@@ -281,6 +312,7 @@ fn valid_browse_id(id: &str) -> Result<(), AppError> {
 
 pub async fn artist(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<ArtistPage> {
     valid_browse_id(&id)?;
+    require_youtube(&st).await?;
     let page = st.yt.artist(&id).await?;
     st.db.upsert_tracks(page.top_songs.clone()).await?;
     Ok(Json(page))
@@ -297,6 +329,7 @@ pub async fn artist_lookup(State(st): State<SharedState>, Query(q): Query<Artist
     if name.is_empty() {
         return Err(AppError::bad("name required"));
     }
+    require_youtube(&st).await?;
     Ok(Json(serde_json::json!({ "id": st.yt.artist_id_for(name).await? })))
 }
 
@@ -310,6 +343,7 @@ pub struct GridQuery {
 /// A grid page, e.g. an artist's full discography (the "See all" of Albums / Singles).
 pub async fn browse_grid(State(st): State<SharedState>, Query(q): Query<GridQuery>) -> ApiResult<GridPage> {
     valid_browse_id(&q.id)?;
+    require_youtube(&st).await?;
     Ok(Json(st.yt.browse_grid(&q.id, q.params.as_deref()).await?))
 }
 
@@ -321,7 +355,7 @@ pub struct YoutubeMatch {
     /// `self`: a YouTube song playing from its own video (`track`); `picked`: a YouTube song playing
     /// from another video you picked (`track`); `matched`: a song from elsewhere playing from
     /// `track`; `none`: looked up and nothing found; `unknown`: not looked up yet (it is when it
-    /// first plays); `plex`: a Plex-only song.
+    /// first plays); `plex`: a Plex-only song; `library`: a song only in Jellyfin or the local folder.
     kind: &'static str,
     track: Option<Track>,
     /// Nothing can play the song right now.
@@ -333,7 +367,10 @@ async fn youtube_match_of(st: &SharedState, video_id: &str) -> Result<YoutubeMat
     if plex::is_plex_id(video_id) {
         return Ok(YoutubeMatch { kind: "plex", track: None, missing });
     }
-    if !spotify::is_spotify_id(video_id) {
+    if sources::is_library_id(video_id) {
+        return Ok(YoutubeMatch { kind: "library", track: None, missing });
+    }
+    if !resolver::is_deferred_id(video_id) {
         if let Some(target) = crate::services::resolver::video_override(&st.db, video_id).await? {
             return Ok(YoutubeMatch { kind: "picked", track: st.db.get_track(&target).await?, missing });
         }
@@ -363,14 +400,15 @@ pub async fn set_youtube_match(
     Path(video_id): Path<String>,
     Json(b): Json<YoutubePick>,
 ) -> ApiResult<YoutubeMatch> {
-    if plex::is_plex_id(&video_id) {
-        return Err(AppError::bad("This song is only in Plex"));
+    require_youtube(&st).await?;
+    if let Some(s) = sources::own_source(&video_id) {
+        return Err(AppError::bad(format!("This song is only in {}", s.label())));
     }
-    if spotify::is_spotify_id(&b.track.video_id) || plex::is_plex_id(&b.track.video_id) {
+    if resolver::is_deferred_id(&b.track.video_id) || sources::is_library_id(&b.track.video_id) {
         return Err(AppError::bad("Pick a YouTube video"));
     }
     st.db.upsert_tracks(vec![b.track.clone()]).await?;
-    if spotify::is_spotify_id(&video_id) {
+    if resolver::is_deferred_id(&video_id) {
         let t = track_or_fetch(&st, &video_id).await?;
         crate::services::resolver::remember(&st.db, &t.artist, &t.title, &b.track.video_id).await?;
     } else {
@@ -383,10 +421,11 @@ pub async fn set_youtube_match(
 /// Forget a song's YouTube match and look again now (also past an earlier "nothing found"). A
 /// YouTube song goes back to playing from its own video.
 pub async fn retry_youtube_match(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<YoutubeMatch> {
-    if plex::is_plex_id(&video_id) {
-        return Err(AppError::bad("This song is only in Plex"));
+    require_youtube(&st).await?;
+    if let Some(s) = sources::own_source(&video_id) {
+        return Err(AppError::bad(format!("This song is only in {}", s.label())));
     }
-    if !spotify::is_spotify_id(&video_id) {
+    if !resolver::is_deferred_id(&video_id) {
         crate::services::resolver::set_video_override(&st.db, &video_id, None).await?;
         crate::services::missing::clear(&st, &video_id).await;
         return Ok(Json(youtube_match_of(&st, &video_id).await?));
@@ -410,7 +449,19 @@ pub async fn search_videos(State(st): State<SharedState>, Query(q): Query<Search
     if q.q.trim().is_empty() {
         return Ok(Json(vec![]));
     }
+    require_youtube(&st).await?;
     let tracks = st.yt.search_videos(&q.q, q.limit.unwrap_or(20)).await?;
     st.db.upsert_tracks(tracks.clone()).await?;
     Ok(Json(tracks))
+}
+
+#[derive(Deserialize)]
+pub struct LibrarySearchQuery {
+    q: String,
+}
+
+/// Songs from every library source that's on (Plex, Jellyfin, local folder), in priority
+/// order, under their source-only ids. Never asks YouTube.
+pub async fn library_search(State(st): State<SharedState>, Query(q): Query<LibrarySearchQuery>) -> ApiResult<Vec<Track>> {
+    Ok(Json(sources::search_library(&st, q.q.trim(), 50).await))
 }

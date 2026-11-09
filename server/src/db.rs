@@ -38,6 +38,23 @@ CREATE TABLE IF NOT EXISTS plex_matches (
     checked_at INTEGER NOT NULL
 );
 
+-- What a song plays from in a library other than Plex (like plex_matches; `source` is
+-- 'jellyfin' for now). `item_id`: the Jellyfin item id.
+CREATE TABLE IF NOT EXISTS source_matches (
+    source     TEXT NOT NULL,
+    video_id   TEXT NOT NULL,
+    matched    INTEGER NOT NULL,
+    item_id    TEXT,
+    codec      TEXT,
+    title      TEXT,
+    artist     TEXT,
+    checked_at INTEGER NOT NULL,
+    manual     INTEGER NOT NULL DEFAULT 0,
+    version    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (source, video_id)
+);
+
+
 CREATE TABLE IF NOT EXISTS history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     video_id    TEXT NOT NULL,

@@ -41,6 +41,7 @@ export const MatchIcon = svg("M7 7h11l-3-3M17 17H6l3 3");
 export const PlusIcon = svg("M12 5v14M5 12h14");
 export const TrashIcon = svg("M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6");
 export const ChevronDown = svg("M6 9l6 6 6-6");
+export const ChevronUp = svg("M6 15l6-6 6 6");
 export const DragIcon = svg("M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01");
 export const VolumeIcon = svg("M11 5 6 9H2v6h4l5 4zM15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14");
 export const VolumeLowIcon = svg("M11 5 6 9H2v6h4l5 4zM15.5 8.5a5 5 0 0 1 0 7");

@@ -129,6 +129,9 @@ pub struct JobStarted {
 }
 
 pub async fn import_ytmusic(State(st): State<SharedState>) -> ApiResult<JobStarted> {
+    if !crate::services::sources::youtube_enabled(&st.db).await {
+        return Err(AppError::NotConfigured("YouTube is turned off in Settings → Audio sources".into()));
+    }
     if !st.yt.is_authenticated().await {
         return Err(AppError::NotConfigured("Add your YouTube Music cookie in Settings first".into()));
     }
@@ -162,6 +165,9 @@ pub struct TextBody {
     content: String,
     #[serde(default)]
     provider: Option<String>,
+    /// Don't look songs up on YouTube now: each is matched when it first plays.
+    #[serde(default)]
+    lazy: bool,
 }
 
 pub async fn import_text(State(st): State<SharedState>, Json(b): Json<TextBody>) -> ApiResult<JobStarted> {
@@ -170,7 +176,7 @@ pub async fn import_text(State(st): State<SharedState>, Json(b): Json<TextBody>)
         return Err(AppError::bad("No tracks found. Use a CSV export or 'Artist - Title' lines."));
     }
     let provider = b.provider.filter(|p| !p.is_empty()).unwrap_or_else(|| "file".into());
-    let job_id = importers::start(st.clone(), &provider, async move { Ok(items) }).await?;
+    let job_id = importers::start_with(st.clone(), &provider, b.lazy, async move { Ok(items) }).await?;
     Ok(Json(JobStarted { job_id }))
 }
 
@@ -182,6 +188,9 @@ pub struct FileQuery {
     provider: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    /// Don't look songs up on YouTube now: each is matched when it first plays.
+    #[serde(default)]
+    lazy: bool,
 }
 
 pub async fn import_file(
@@ -192,7 +201,7 @@ pub async fn import_file(
     let name = q.name.unwrap_or_else(|| "upload".into());
     let items = fileimport::parse(&body, &name).map_err(|e| AppError::bad(format!("{e:#}")))?;
     let provider = q.provider.filter(|p| !p.is_empty()).unwrap_or_else(|| "file".into());
-    let job_id = importers::start(st.clone(), &provider, async move { Ok(items) }).await?;
+    let job_id = importers::start_with(st.clone(), &provider, q.lazy, async move { Ok(items) }).await?;
     Ok(Json(JobStarted { job_id }))
 }
 

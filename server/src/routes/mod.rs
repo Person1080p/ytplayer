@@ -1,4 +1,5 @@
 pub mod art;
+pub mod jellyfin;
 pub mod library;
 pub mod music;
 pub mod playlists;
@@ -123,6 +124,17 @@ pub fn router(state: SharedState) -> Router {
             get(settings::plex_get_match).put(settings::plex_set_match).delete(settings::plex_clear_match),
         )
         .route("/plex/art", get(settings::plex_art))
+        // Jellyfin (routes/jellyfin.rs)
+        .route("/jellyfin/server", put(jellyfin::connect))
+        .route("/jellyfin", delete(jellyfin::disconnect))
+        .route("/jellyfin/search", get(jellyfin::search))
+        .route(
+            "/jellyfin/matches/{video_id}",
+            get(jellyfin::get_match).put(jellyfin::set_match).delete(jellyfin::clear_match),
+        )
+        .route("/jellyfin/art", get(jellyfin::art))
+        // every enabled source at once (search with YouTube off, and the source sheet)
+        .route("/sources/search", get(music::library_search))
         .route("/profile", get(profile::get).put(profile::set))
         .route("/profile/fresh/reset", post(profile::reset_fresh))
         .route("/events", get(events))

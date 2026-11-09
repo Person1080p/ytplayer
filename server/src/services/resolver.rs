@@ -1,11 +1,12 @@
-//! Map (artist, title) pairs from other services onto YouTube Music video ids.
+//! Map (artist, title) pairs from other services onto YouTube Music video ids (or, with YouTube
+//! off, onto the library sources' copies).
 
 use rusqlite::{params, OptionalExtension};
 
 use crate::{
     db::Db,
     models::{now, Track},
-    services::{matching, ytmusic::YtMusic},
+    services::{matching, sources, ytmusic::YtMusic},
 };
 
 const THRESHOLD: f32 = 0.62;
@@ -54,11 +55,98 @@ fn key(artist: &str, title: &str) -> String {
     format!("{}|{}", matching::primary_artist(artist), matching::normalize(title))
 }
 
+// ---- songs matched when they play -------------------------------------------------------------
+
+const SONG_PREFIX: &str = "song_";
+
+/// The id of a song added without a YouTube video (a library import that doesn't look songs up):
+/// stable per artist and title, so the same song imported twice is one song.
+pub fn song_id(artist: &str, title: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key(artist, title).as_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{SONG_PREFIX}{hex}")
+}
+
+pub fn is_song_id(video_id: &str) -> bool {
+    video_id
+        .strip_prefix(SONG_PREFIX)
+        .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A song from the music folder on a device running the web app (`local_<16 hex>`, made by the
+/// app from its artist and title). The server can't reach that folder: elsewhere such a song plays
+/// like an imported one, matched by its tags.
+pub fn is_local_id(video_id: &str) -> bool {
+    video_id
+        .strip_prefix("local_")
+        .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A song with no YouTube video of its own (a Spotify playlist song, or a library import added
+/// without looking it up): matched by title, artist and length when first needed.
+pub fn is_deferred_id(video_id: &str) -> bool {
+    crate::services::spotify::is_spotify_id(video_id) || is_song_id(video_id) || is_local_id(video_id)
+}
+
+/// The YouTube video a deferred song plays from: looked up the first time it's needed (when it
+/// plays, or radio starts from it), then remembered. None when YouTube has nothing convincing
+/// (or is off).
+pub async fn deferred_youtube_id(st: &crate::state::AppState, video_id: &str) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+    if !sources::youtube_enabled(&st.db).await {
+        return Ok(None);
+    }
+    let mut t = st.db.get_track(video_id).await?.context("unknown song")?;
+    let found = resolve(&st.yt, &st.db, &t.artist, &t.title, t.duration).await?;
+    // An imported or device-folder song has no art of its own on the server: use its video's
+    // (Spotify songs get Spotify's).
+    if let Some(f) = &found {
+        if is_song_id(video_id) || is_local_id(video_id) {
+            if t.thumbnail.is_none() && f.thumbnail.is_some() {
+                t.thumbnail = f.thumbnail.clone();
+                st.db.upsert_tracks(vec![t]).await?;
+            }
+            // Its library entry is matched now (it keeps the song's id, which queues refer to).
+            let id = video_id.to_string();
+            st.db
+                .call(move |c| c.execute("UPDATE liked SET status='matched' WHERE video_id=?1 AND status='deferred'", [id]))
+                .await?;
+        }
+    }
+    Ok(found.map(|t| t.video_id))
+}
+
 /// The remembered match for a song: `Some(Some(id))` matched, `Some(None)` looked up and nothing
 /// found, `None` never looked up.
 pub async fn remembered(db: &Db, artist: &str, title: &str) -> anyhow::Result<Option<Option<String>>> {
     let k = key(artist, title);
     db.call(move |c| c.query_row("SELECT video_id FROM lookup_cache WHERE key=?1", [k], |r| r.get(0)).optional()).await
+}
+
+/// A song from an import: its YouTube match, or with YouTube off its copy in the library
+/// sources (in priority order), as a song under its source-only id (`plex_…`, `jf_…`, `local_…`)
+/// so the library entry plays from that file. `force` ignores a cached "no match" on YouTube.
+pub async fn resolve_song(
+    st: &crate::state::AppState,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+    duration: Option<u32>,
+    force: bool,
+) -> anyhow::Result<Option<Track>> {
+    if sources::youtube_enabled(&st.db).await {
+        return resolve_opts(&st.yt, &st.db, artist, title, duration, force).await;
+    }
+    let want = Track {
+        video_id: song_id(artist, title),
+        title: title.to_string(),
+        artist: artist.to_string(),
+        album: album.map(String::from),
+        duration,
+        thumbnail: None,
+    };
+    Ok(sources::best_match(st, &want).await)
 }
 
 pub async fn resolve(
@@ -98,6 +186,9 @@ pub async fn resolve_opts(
         }
         Some((None, at)) if !force && now() - at < NEGATIVE_TTL => return Ok(None),
         _ => {}
+    }
+    if !sources::youtube_enabled(db).await {
+        anyhow::bail!("{}", sources::YOUTUBE_OFF);
     }
 
     let pick = |results: Vec<Track>| {
@@ -141,4 +232,20 @@ pub async fn resolve_opts(
     })
     .await?;
     Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn song_ids() {
+        let a = song_id("Daft Punk", "Get Lucky");
+        assert!(is_song_id(&a) && is_deferred_id(&a));
+        assert_eq!(a, song_id("Daft Punk", "Get Lucky"));
+        assert_ne!(a, song_id("Daft Punk", "One More Time"));
+        assert!(!is_song_id("dQw4w9WgXcQ") && !is_deferred_id("dQw4w9WgXcQ"));
+        assert!(!is_song_id("song_xyz"));
+        assert!(is_deferred_id("spotify_3OYqNt713cxVT3R0idEfZp"));
+    }
 }

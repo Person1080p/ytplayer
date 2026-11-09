@@ -109,10 +109,12 @@ async fn record_play(state: SharedState, s: PlaySession) {
     // anonymous visitors.
     let want_scrobble =
         !fresh && state.lastfm.session().await.is_some() && state.db.get_bool("prefs.scrobble", true).await;
-    // A Plex-only or Spotify song isn't a YouTube video, so there's nothing to report there.
+    // A library-only, Spotify or imported-unmatched song isn't a YouTube video, so there's nothing
+    // to report there; nor with YouTube turned off.
     let want_yt = !fresh
-        && !crate::services::plex::is_plex_id(&vid)
-        && !crate::services::spotify::is_spotify_id(&vid)
+        && !crate::services::sources::is_library_id(&vid)
+        && !crate::services::resolver::is_deferred_id(&vid)
+        && crate::services::sources::youtube_enabled(&state.db).await
         && state.yt.signed_in_now().await
         && state.db.get_bool("prefs.report_youtube", true).await;
 
@@ -160,7 +162,10 @@ async fn record_play(state: SharedState, s: PlaySession) {
 /// Older plays are left alone: YouTube files a report under the time it arrives, so a days-old
 /// play would show up in your history as if you'd just played it.
 async fn retry_youtube(state: &Arc<AppState>) -> anyhow::Result<()> {
-    if !state.yt.signed_in_now().await || !state.db.get_bool("prefs.report_youtube", true).await {
+    if !crate::services::sources::youtube_enabled(&state.db).await
+        || !state.yt.signed_in_now().await
+        || !state.db.get_bool("prefs.report_youtube", true).await
+    {
         return Ok(());
     }
     let profile = state.db.active_profile().await;

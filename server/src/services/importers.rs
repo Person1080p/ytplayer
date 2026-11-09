@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     models::{now, ImportItem},
-    services::{lastfm, matching, resolver},
+    services::{lastfm, matching, resolver, sources},
     state::{ServerEvent, SharedState},
 };
 
@@ -16,6 +16,15 @@ use crate::{
 
 /// Create an import job and run it in the background. `fetch` produces the provider's items.
 pub async fn start<F>(state: SharedState, provider: &str, fetch: F) -> anyhow::Result<i64>
+where
+    F: std::future::Future<Output = anyhow::Result<Vec<ImportItem>>> + Send + 'static,
+{
+    start_with(state, provider, false, fetch).await
+}
+
+/// Like [`start`]. `lazy`: don't look songs up on YouTube now; each is added as a song matched
+/// when it first plays (like a Spotify playlist's), unless its match is already known.
+pub async fn start_with<F>(state: SharedState, provider: &str, lazy: bool, fetch: F) -> anyhow::Result<i64>
 where
     F: std::future::Future<Output = anyhow::Result<Vec<ImportItem>>> + Send + 'static,
 {
@@ -30,7 +39,7 @@ where
 
     let provider = provider.to_string();
     tokio::spawn(crate::services::ytlog::with_origin(format!("import:{provider}"), async move {
-        let result = run(&state, job_id, &provider, fetch).await;
+        let result = run(&state, job_id, &provider, lazy, fetch).await;
         let (status, err) = match result {
             Ok(()) => ("done", None),
             Err(e) => {
@@ -52,7 +61,7 @@ where
     Ok(job_id)
 }
 
-async fn run<F>(state: &SharedState, job_id: i64, provider: &str, fetch: F) -> anyhow::Result<()>
+async fn run<F>(state: &SharedState, job_id: i64, provider: &str, lazy: bool, fetch: F) -> anyhow::Result<()>
 where
     F: std::future::Future<Output = anyhow::Result<Vec<ImportItem>>>,
 {
@@ -60,12 +69,20 @@ where
     let total = items.len() as i64;
     state.db.call(move |c| c.execute("UPDATE import_jobs SET total=?1 WHERE id=?2", params![total, job_id])).await?;
     state.emit(ServerEvent::Import { job_id });
-    process_items(state, job_id, provider, items, 0, 0).await?;
+    let (matched, deferred) = process_items(state, job_id, provider, items, 0, 0, lazy).await?;
+    if deferred > 0 {
+        let note = match deferred {
+            1 => "1 song is matched when it first plays".to_string(),
+            n => format!("{n} songs are matched when they first play"),
+        };
+        set_job(state, job_id, total, matched, note).await?;
+    }
     Ok(())
 }
 
-/// Match and store items. `done0`/`matched0` are progress already made by the job.
-/// Returns how many were matched.
+/// Match and store items. `done0`/`matched0` are progress already made by the job. `lazy`: add
+/// songs without a known match as songs matched on play instead of looking them up.
+/// Returns how many were matched, and how many were left to match on play.
 async fn process_items(
     state: &SharedState,
     job_id: i64,
@@ -73,8 +90,10 @@ async fn process_items(
     items: Vec<ImportItem>,
     done0: i64,
     matched0: i64,
-) -> anyhow::Result<i64> {
+    lazy: bool,
+) -> anyhow::Result<(i64, i64)> {
     let mut matched = matched0;
+    let mut deferred = 0;
     for (i, it) in items.into_iter().enumerate() {
         // Skip re-matching rows that were already matched by a previous import.
         let (p, pid) = (provider.to_string(), it.provider_id.clone());
@@ -86,7 +105,11 @@ async fn process_items(
             })
             .await?;
 
+        // A full import looks up songs an earlier quick one left to match on play.
+        let existing = existing.filter(|v| lazy || !resolver::is_song_id(v));
+
         // "error" = the lookup itself failed (e.g. rate limited) — retried by "Retry unmatched".
+        // "deferred" = matched when it first plays.
         let mut status = "unmatched";
         let video_id = match (it.video_id.clone(), existing) {
             (Some(v), _) => {
@@ -94,10 +117,15 @@ async fn process_items(
                 Some(v)
             }
             (None, Some(v)) => Some(v),
+            (None, None) if lazy => match resolver::remembered(&state.db, &it.artist, &it.title).await? {
+                Some(Some(v)) => Some(v),
+                _ => Some(deferred_song(state, &it).await?),
+            },
             (None, None) => {
                 // Spacing between YouTube requests is handled by YtMusic's background pacer
-                // (or, at the original pace, by this short per-song pause).
-                let r = resolver::resolve(&state.yt, &state.db, &it.artist, &it.title, it.duration).await;
+                // (or, at the original pace, by this short per-song pause). With YouTube off this
+                // looks in the library sources instead.
+                let r = resolver::resolve_song(state, &it.artist, &it.title, it.album.as_deref(), it.duration, false).await;
                 tokio::time::sleep(state.yt.song_gap()).await;
                 match r {
                     Ok(t) => t.map(|t| t.video_id),
@@ -109,11 +137,14 @@ async fn process_items(
                 }
             }
         };
-        if video_id.is_some() {
-            status = "matched";
-        }
-        if video_id.is_some() {
-            matched += 1;
+        if let Some(v) = &video_id {
+            if resolver::is_song_id(v) {
+                status = "deferred";
+                deferred += 1;
+            } else {
+                status = "matched";
+                matched += 1;
+            }
         }
         let p = provider.to_string();
         let done = done0 + i as i64 + 1;
@@ -148,18 +179,41 @@ async fn process_items(
             state.emit(ServerEvent::Import { job_id });
         }
     }
-    Ok(matched - matched0)
+    Ok((matched - matched0, deferred))
+}
+
+/// The song an import adds without looking it up: its own id and details, matched on play.
+async fn deferred_song(state: &SharedState, it: &ImportItem) -> anyhow::Result<String> {
+    let id = resolver::song_id(&it.artist, &it.title);
+    if state.db.get_track(&id).await?.is_none() {
+        state
+            .db
+            .upsert_tracks(vec![crate::models::Track {
+                video_id: id.clone(),
+                title: it.title.clone(),
+                artist: it.artist.clone(),
+                album: it.album.clone(),
+                duration: it.duration,
+                thumbnail: None,
+            }])
+            .await?;
+    }
+    Ok(id)
 }
 
 /// Make sure a track row exists for an item that already carries a YouTube id.
-/// Uses the export's own metadata when complete, otherwise asks YouTube.
+/// Uses the export's own metadata when complete, otherwise asks YouTube (when it's on).
 async fn ensure_track(state: &SharedState, video_id: &str, it: &ImportItem) {
-    if matches!(state.db.get_track(video_id).await, Ok(Some(_))) || crate::services::plex::is_plex_id(video_id)
-        || crate::services::spotify::is_spotify_id(video_id)
+    if matches!(state.db.get_track(video_id).await, Ok(Some(_))) || sources::is_library_id(video_id)
+        || resolver::is_deferred_id(video_id)
     {
         return;
     }
-    let track = if !it.title.is_empty() && !it.artist.is_empty() {
+    let complete = !it.title.is_empty() && !it.artist.is_empty();
+    if !complete && !sources::youtube_enabled(&state.db).await {
+        return;
+    }
+    let track = if complete {
         Some(crate::models::Track {
             video_id: video_id.to_string(),
             title: it.title.clone(),
@@ -213,19 +267,19 @@ pub async fn start_rematch(state: SharedState) -> anyhow::Result<i64> {
 }
 
 async fn rematch(state: &SharedState, job_id: i64) -> anyhow::Result<()> {
-    let rows: Vec<(i64, String, String, Option<u32>)> = state
+    let rows: Vec<(i64, String, String, Option<String>, Option<u32>)> = state
         .db
         .call(|c| {
-            let mut st = c.prepare("SELECT id, artist, title, duration FROM liked WHERE status IN ('unmatched','error')")?;
-            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let mut st = c.prepare("SELECT id, artist, title, album, duration FROM liked WHERE status IN ('unmatched','error')")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
             rows.collect()
         })
         .await?;
     let total = rows.len() as i64;
     state.db.call(move |c| c.execute("UPDATE import_jobs SET total=?1 WHERE id=?2", params![total, job_id])).await?;
     let mut matched = 0i64;
-    for (i, (id, artist, title, duration)) in rows.into_iter().enumerate() {
-        let (vid, status) = match resolver::resolve_opts(&state.yt, &state.db, &artist, &title, duration, true).await {
+    for (i, (id, artist, title, album, duration)) in rows.into_iter().enumerate() {
+        let (vid, status) = match resolver::resolve_song(state, &artist, &title, album.as_deref(), duration, true).await {
             Ok(Some(t)) => (Some(t.video_id), "matched"),
             Ok(None) => (None, "unmatched"),
             Err(e) => {
@@ -563,7 +617,7 @@ async fn lastfm_two_way(state: &SharedState, job_id: i64) -> anyhow::Result<()> 
 
     let added_n = plan.add.len();
     let items: Vec<ImportItem> = plan.add.iter().map(|(_, a, t)| lastfm_item(a.clone(), t.clone())).collect();
-    let matched = process_items(state, job_id, "lastfm", items, done, 0).await?;
+    let (matched, _) = process_items(state, job_id, "lastfm", items, done, 0, false).await?;
     synced.extend(plan.add.iter().map(|(k, _, _)| (k.clone(), true)));
     save_synced(state, &synced).await?;
     set_job(state, job_id, done + added_n as i64, matched, summary(loved_n, unloved_n, removed_n, added_n, failed)).await?;
@@ -613,6 +667,9 @@ pub fn spawn_lastfm_sync(state: SharedState) {
 // ---- YouTube Music ------------------------------------------------------------
 
 pub async fn ytmusic_liked(state: SharedState) -> anyhow::Result<Vec<ImportItem>> {
+    if !sources::youtube_enabled(&state.db).await {
+        bail!("{}", sources::YOUTUBE_OFF);
+    }
     let tracks = state.yt.liked_songs(10_000).await?;
     state.db.upsert_tracks(tracks.clone()).await?;
     Ok(tracks

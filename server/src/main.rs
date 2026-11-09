@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         ytdlp: YtDlp::new(http.clone(), cfg.ytdlp_path.clone(), cfg.data_dir.clone(), cfg.bin_dir.clone()),
         audio_cache: Arc::new(services::audiocache::AudioCache::new(&cfg.data_dir, db.clone(), http.clone())),
         plex: Plex::new(http.clone(), db.clone()),
+        jellyfin: services::jellyfin::Jellyfin::new(http.clone(), db.clone()),
         lastfm: LastFm::new(http.clone(), db.clone(), cfg.lastfm_api_key.clone(), cfg.lastfm_api_secret.clone()),
         queue: Mutex::new(Queue::load(&db).await),
         sessions: Mutex::new(HashMap::new()),
@@ -53,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
     state.yt.set_pace(&routes::settings::import_pace(&state).await);
 
     // Make sure yt-dlp is available before the first play request (downloads it if needed).
-    {
+    // Not with YouTube off: then nothing runs yt-dlp.
+    if services::sources::youtube_enabled(&state.db).await {
         let st = state.clone();
         tokio::spawn(async move {
             match st.ytdlp.version().await {

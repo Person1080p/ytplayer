@@ -1,17 +1,26 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   api,
   fmtTime,
-  isPlexId,
-  isSpotifyId,
+  isDeferredId,
+  isLibraryOnlyId,
+  libraryApi,
+  libraryItem,
+  SOURCE_LABELS,
+  type LibraryChoice,
+  type LibrarySourceId,
   type PlaylistSummary,
-  type PlexChoice,
+  type SourceId,
+  type SourceInfo,
+  type Status,
   type Track,
   type YoutubeMatch,
 } from "../lib/api";
 import { setLiked, useLibrary } from "../lib/library";
 import { enqueue, playRadio, reloadSource } from "../lib/player";
+import { sourceConnected, sourceOn, useStatus, youtubeOn } from "../lib/serverStatus";
+import { localUrl, prepareLocal } from "../lib/localFolder";
 import { currentTrack, useStore } from "../lib/store";
 import {
   HeartFilledIcon,
@@ -27,6 +36,15 @@ import {
 } from "./Icons";
 import { Cover } from "./TrackRow";
 import { artistLink } from "./Shelf";
+
+/** Where a song plays from now: the music folder on this device, else what the server says. */
+async function sourceNow(track: Track): Promise<SourceInfo> {
+  await prepareLocal(track);
+  if (localUrl(track.videoId)) {
+    return { source: "local", kbps: null, item: { source: "local", itemId: "", title: track.title, artist: track.artist } };
+  }
+  return api.source(track.videoId);
+}
 
 export function Sheet({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
   useEffect(() => {
@@ -51,6 +69,7 @@ export function TrackMenu() {
   const pick = useStore((s) => s.pickPlaylist);
   const nav = useNavigate();
   const inLibrary = useLibrary((s) => (track ? s.ids.has(track.videoId) : false));
+  const status = useStatus();
   if (!track) return null;
 
   const act = (fn: () => void) => () => {
@@ -86,16 +105,19 @@ export function TrackMenu() {
         {inLibrary ? <HeartFilledIcon size={20} /> : <HeartIcon size={20} />}
         {inLibrary ? "Remove from library" : "Add to library"}
       </button>
-      <button
-        className="sheet-item"
-        onClick={act(() => {
-          useStore.getState().setNowPlaying(false);
-          nav(artistLink(track.artist));
-        })}
-      >
-        <SearchIcon size={20} /> Go to {track.artist.split(",")[0]}
-      </button>
-      {!isPlexId(track.videoId) && (
+      {/* Artist pages come from YouTube Music. */}
+      {youtubeOn(status) && (
+        <button
+          className="sheet-item"
+          onClick={act(() => {
+            useStore.getState().setNowPlaying(false);
+            nav(artistLink(track.artist));
+          })}
+        >
+          <SearchIcon size={20} /> Go to {track.artist.split(",")[0]}
+        </button>
+      )}
+      {sourceTabs(track, status).length > 0 && (
         <button className="sheet-item" onClick={() => useStore.getState().choosePlexVersion(track)}>
           <MatchIcon size={20} /> Change audio source…
         </button>
@@ -104,67 +126,107 @@ export function TrackMenu() {
   );
 }
 
-// Whether a Plex server is connected, asked once per session (and again after a failure).
-let plexConnected: Promise<boolean> | null = null;
-function usePlexConnected(active: boolean) {
-  const [on, setOn] = useState(false);
+const TAB_LABELS: Record<SourceId, string> = { youtube: "YouTube", plex: "Plex", jellyfin: "Jellyfin", local: "Folder" };
+const DEFAULT_ORDER: SourceId[] = ["plex", "jellyfin", "local", "youtube"];
+
+/**
+ * The audio source sheet's tabs for a song, in priority order: YouTube (while it's on) and each
+ * library that's set up. A song that's only in one library gets the other libraries.
+ */
+export function sourceTabs(track: Track, status: Status | null): SourceId[] {
+  const own = libraryItem(track.videoId)?.source;
+  const order = status?.prefs.sources?.map((p) => p.id) ?? DEFAULT_ORDER;
+  return order.filter((id) =>
+    id === "youtube" ? !isLibraryOnlyId(track.videoId) && youtubeOn(status) : id !== own && sourceConnected(status, id),
+  );
+}
+
+export const isLibrarySource = (s: string | null | undefined): s is LibrarySourceId =>
+  s === "plex" || s === "jellyfin" || s === "local";
+
+/**
+ * Change where a song's audio comes from. A tab per source:
+ * - YouTube: the video it plays from (a song's own video, or one matched for a Spotify or imported
+ *   song), a search of YouTube's songs and videos to pick another, or "look again".
+ * - Plex, Jellyfin, Folder: automatic matching, a copy you pick (the studio recording rather than
+ *   a live one), or never that library for this song.
+ * Changes apply straight away; the song switches over in place if it's playing.
+ */
+export function AudioSourceSheet() {
+  const track = useStore((s) => s.plexMatchTrack);
+  const status = useStatus();
+  const missing = useStore((s) => (track ? s.missing.has(track.videoId) : false));
+  const close = () => useStore.getState().choosePlexVersion(null);
+  // A tab picked by hand; otherwise the sheet opens on the source that plays now.
+  const [picked, setPicked] = useState<SourceId | null>(null);
+  const [now, setNow] = useState<SourceInfo | "error" | null>(null);
+  const [yt, setYt] = useState<YoutubeMatch | null>(null);
+  const [choices, setChoices] = useState<Partial<Record<LibrarySourceId, LibraryChoice | Error>>>({});
+
+  const tabs = track ? sourceTabs(track, status) : [];
+  const hasYoutube = tabs.includes("youtube");
+  const libraryKey = tabs.filter(isLibrarySource).join(",");
+
   useEffect(() => {
-    if (!active) return;
-    plexConnected ??= api.status().then(
-      (s) => s.plex.connected,
-      () => ((plexConnected = null), false),
-    );
+    setPicked(null);
+    setNow(null);
+    setYt(null);
+    setChoices({});
+    if (track) sourceNow(track).then(setNow, () => setNow("error"));
+  }, [track]);
+  useEffect(() => {
+    if (track && hasYoutube) api.youtubeMatch(track.videoId).then(setYt, () => {});
+  }, [track, hasYoutube]);
+  useEffect(() => {
+    if (!track || !libraryKey) return;
     let live = true;
-    plexConnected.then((v) => live && setOn(v));
+    for (const id of libraryKey.split(",") as LibrarySourceId[]) {
+      libraryApi(id)
+        .match(track.videoId)
+        .then(
+          (c): LibraryChoice | Error => c,
+          (e) => (e instanceof Error ? e : new Error(String(e))),
+        )
+        .then((c) => live && setChoices((cur) => ({ ...cur, [id]: c })));
+    }
     return () => {
       live = false;
     };
-  }, [active]);
-  return on;
-}
-
-/**
- * Change where a song's audio comes from. Two tabs:
- * - YouTube (songs from Spotify): the video it's matched to, a search of YouTube's songs and
- *   videos to pick another, or "search again" after nothing was found.
- * - Plex: automatic matching, a Plex copy you pick (the studio recording rather than a live one),
- *   or not Plex at all.
- * Changes apply straight away; the song switches over in place if it's playing.
- */
-export function PlexVersionSheet() {
-  const track = useStore((s) => s.plexMatchTrack);
-  const plexOn = usePlexConnected(!!track);
-  const missing = useStore((s) => (track ? s.missing.has(track.videoId) : false));
-  const close = () => useStore.getState().choosePlexVersion(null);
-  const [tab, setTab] = useState<"youtube" | "plex">("youtube");
-  // Picked a tab by hand: don't switch to Plex when its answer arrives.
-  const tabTouched = useRef(false);
-  const [plexChoice, setPlexChoice] = useState<PlexChoice | null>(null);
-  const [yt, setYt] = useState<YoutubeMatch | null>(null);
-
-  const spotify = !!track && isSpotifyId(track.videoId);
-  const youtubeTab = !!track && !isPlexId(track.videoId);
-  const plexTab = plexOn && youtubeTab;
-  useEffect(() => {
-    setPlexChoice(null);
-    setYt(null);
-    tabTouched.current = false;
-    setTab("youtube");
-    if (track && !isPlexId(track.videoId)) api.youtubeMatch(track.videoId).then(setYt, () => {});
-  }, [track]);
-  useEffect(() => {
-    if (!track || !plexTab) return;
-    api.plexMatch(track.videoId).then((c) => {
-      setPlexChoice(c);
-      // A Plex copy is what plays: open on the tab that changes it.
-      if (!tabTouched.current && c.current && c.mode !== "off") setTab("plex");
-    }, () => {});
-  }, [track, plexTab]);
+  }, [track, libraryKey]);
   if (!track) return null;
 
-  const plexPlays = !!plexChoice?.current && plexChoice.mode !== "off";
-  const plexCurrent = plexPlays ? plexChoice?.candidates.find((c) => c.track.videoId === `plex_${plexChoice.current}`)?.track : null;
-  const tabs = [...(youtubeTab ? (["youtube"] as const) : []), ...(plexTab ? (["plex"] as const) : [])];
+  const info = now && now !== "error" ? now : null;
+  const playsFrom = info?.source ?? null;
+  const libraryPlays = isLibrarySource(playsFrom) ? playsFrom : null;
+  const autoTab: SourceId | undefined =
+    (libraryPlays && tabs.includes(libraryPlays) ? libraryPlays : undefined) ?? (hasYoutube ? "youtube" : tabs[0]);
+  const tab = picked && tabs.includes(picked) ? picked : autoTab;
+  const deferred = isDeferredId(track.videoId);
+
+  const youtubeLine = () =>
+    yt?.kind === "picked"
+      ? `Plays from a YouTube video you picked${yt.track ? `: ${yt.track.title} · ${yt.track.artist}` : ""}.`
+      : !deferred
+        ? "Plays from YouTube (its own video)."
+        : yt?.kind === "matched" && yt.track
+          ? `Plays from YouTube: ${yt.track.title} · ${yt.track.artist}.`
+          : yt?.kind === "none"
+            ? "Nothing was found on YouTube. Pick a video below."
+            : yt
+              ? "Found on YouTube the first time it plays, or pick one below."
+              : "…";
+  const line =
+    missing && !libraryPlays
+      ? "No audio found for this song. Pick a source below."
+      : libraryPlays
+        ? `Plays from ${SOURCE_LABELS[libraryPlays]}${info?.item ? `: ${info.item.title} · ${info.item.artist}` : ""}.`
+        : playsFrom === "cache"
+          ? "Plays from the server's MP3 copy of a YouTube play."
+          : playsFrom === "youtube" || (now === "error" && hasYoutube)
+            ? youtubeLine()
+            : now === "error"
+              ? ""
+              : "…";
 
   return (
     <Sheet onClose={close}>
@@ -177,48 +239,24 @@ export function PlexVersionSheet() {
           </div>
         </div>
       </div>
-      <p className={`small source-now ${missing ? "missing" : ""}`}>
-        {missing && !plexPlays
-          ? "No audio found for this song. Pick a source below."
-          : plexPlays
-            ? `Plays from Plex${plexCurrent ? `: ${plexCurrent.album ?? plexCurrent.title}` : ""}.`
-            : yt?.kind === "picked"
-              ? `Plays from a YouTube video you picked${yt.track ? `: ${yt.track.title} · ${yt.track.artist}` : ""}.`
-              : !spotify
-              ? "Plays from YouTube (its own video)."
-              : yt?.kind === "matched" && yt.track
-                ? `Plays from YouTube: ${yt.track.title} · ${yt.track.artist}.`
-                : yt?.kind === "none"
-                  ? "Nothing was found on YouTube. Pick a video below."
-                  : yt
-                    ? "Found on YouTube the first time it plays, or pick one below."
-                    : "…"}
-      </p>
+      {line && <p className={`small source-now ${missing && !libraryPlays ? "missing" : ""}`}>{line}</p>}
       {tabs.length > 1 && (
         <div className="tabs" role="tablist" style={{ margin: "0 8px 10px" }}>
           {tabs.map((t) => (
-            <button
-              key={t}
-              role="tab"
-              aria-selected={tab === t}
-              className={tab === t ? "on" : ""}
-              onClick={() => {
-                tabTouched.current = true;
-                setTab(t);
-              }}
-            >
-              {t === "youtube" ? "YouTube" : "Plex"}
+            <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? "on" : ""} onClick={() => setPicked(t)}>
+              {TAB_LABELS[t]}
             </button>
           ))}
         </div>
       )}
-      {tab === "youtube" && youtubeTab ? (
-        <YoutubePane track={track} match={yt} onMatch={setYt} plexPlays={plexPlays} missing={missing} onDone={close} />
-      ) : plexTab ? (
-        <PlexPane track={track} choice={plexChoice} onDone={close} />
+      {tab === "youtube" ? (
+        <YoutubePane track={track} match={yt} onMatch={setYt} libraryPlays={libraryPlays} missing={missing} onDone={close} />
+      ) : tab ? (
+        <LibraryPane key={tab} source={tab} track={track} choice={choices[tab] ?? null} on={sourceOn(status, tab)} onDone={close} />
       ) : (
         <p className="muted small" style={{ margin: "0 8px" }}>
-          Connect Plex in Settings to play this song from your Plex library.
+          Turn on YouTube or connect a library (Plex, Jellyfin or a music folder) in Settings → Audio sources to choose where
+          this song plays from.
         </p>
       )}
     </Sheet>
@@ -246,19 +284,20 @@ function useApply(track: Track, onDone: () => void) {
   return { busy, run };
 }
 
-/** A song from Spotify: the YouTube video it plays from, and YouTube's songs and videos to pick from. */
+/** The YouTube video a song plays from, and YouTube's songs and videos to pick from. */
 function YoutubePane({
   track,
   match,
   onMatch,
-  plexPlays,
+  libraryPlays,
   missing,
   onDone,
 }: {
   track: Track;
   match: YoutubeMatch | null;
   onMatch: (m: YoutubeMatch) => void;
-  plexPlays: boolean;
+  /** A library plays this song now, not YouTube. */
+  libraryPlays: LibrarySourceId | null;
   missing: boolean;
   onDone: () => void;
 }) {
@@ -281,7 +320,7 @@ function YoutubePane({
       const seen = new Set<string>();
       setResults(
         [...songs.map((t) => ({ track: t, kind: "Song" as const })), ...videos.map((t) => ({ track: t, kind: "Video" as const }))].filter(
-          (r) => !seen.has(r.track.videoId) && !!seen.add(r.track.videoId),
+          (r) => !isLibraryOnlyId(r.track.videoId) && !seen.has(r.track.videoId) && !!seen.add(r.track.videoId),
         ),
       );
     } catch (e) {
@@ -296,8 +335,8 @@ function YoutubePane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [match?.kind]);
 
-  // A YouTube song (not from Spotify): it has its own video, and may play from one picked instead.
-  const own = !isSpotifyId(track.videoId);
+  // A YouTube song (not from Spotify or an import): it has its own video, and may play from one picked instead.
+  const own = !isDeferredId(track.videoId);
   const retry = async () => {
     setRetrying(true);
     try {
@@ -327,18 +366,20 @@ function YoutubePane({
         ? match.track ?? track
         : null;
   const currentId = current?.videoId ?? null;
+  const lib = libraryPlays ? SOURCE_LABELS[libraryPlays] : "";
 
   return (
     <>
-      {plexPlays && (
+      {libraryPlays && (
         <p className="muted small" style={{ margin: "0 8px 10px" }}>
-          A Plex copy plays first while one is matched (Plex tab → “Don't use Plex” to use YouTube).
+          {lib} plays this song now: it comes before YouTube in Settings → Audio sources. To use YouTube, choose “Never use{" "}
+          {lib} for this song” on the {TAB_LABELS[libraryPlays]} tab.
         </p>
       )}
       {current && (
         <div className="match-row current">
           <div className="track-main">
-            <Cover src={current.thumbnail} size={44} />
+            <Cover src={current.thumbnail} size={44} videoId={current.videoId} />
             <div className="track-text">
               <div className="track-title">{current.title}</div>
               <div className="track-sub">
@@ -385,7 +426,7 @@ function YoutubePane({
           return (
             <div key={t.videoId} className={`match-row ${isCurrent ? "current" : ""}`}>
               <button className="track-main" disabled={busy || isCurrent} onClick={() => use(t)} title={isCurrent ? "Plays from this now" : "Use this"}>
-                <Cover src={t.thumbnail} size={44} />
+                <Cover src={t.thumbnail} size={44} videoId={t.videoId} />
                 <div className="track-text">
                   <div className="track-title">{t.title}</div>
                   <div className="track-sub">
@@ -409,60 +450,93 @@ function YoutubePane({
   );
 }
 
-/** Which Plex copy a song plays from: automatic, picked, or none. */
-function PlexPane({ track, choice, onDone }: { track: Track; choice: PlexChoice | null; onDone: () => void }) {
+/** Which copy in one library (Plex, Jellyfin or the music folder) a song plays from: automatic, picked, or none. */
+function LibraryPane({
+  source,
+  track,
+  choice,
+  on,
+  onDone,
+}: {
+  source: LibrarySourceId;
+  track: Track;
+  /** The current choice, or why it couldn't be loaded (null while loading). */
+  choice: LibraryChoice | Error | null;
+  /** The source is on in Settings → Audio sources. */
+  on: boolean;
+  onDone: () => void;
+}) {
   const { busy, run } = useApply(track, onDone);
+  const lib = libraryApi(source);
+  const name = SOURCE_LABELS[source];
   const [q, setQ] = useState(track.title);
   const [results, setResults] = useState<Track[] | null>(null);
+  const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const use = (t: Track) =>
-    run(() => api.plexSetMatch(track.videoId, t.videoId.slice("plex_".length)), `Plays from Plex: ${t.album ?? t.title}`);
+  const loaded = choice instanceof Error ? null : choice;
+  const loadError = choice instanceof Error ? choice.message : null;
+  const itemId = (t: Track) => libraryItem(t.videoId)?.itemId ?? null;
+  const use = (t: Track) => {
+    const id = itemId(t);
+    if (id) run(() => lib.setMatch(track.videoId, id), `Plays from ${name}: ${t.album ?? t.title}`);
+  };
   const search = async () => {
     if (!q.trim()) return;
-    setResults([]);
+    setSearching(true);
+    setError(null);
     try {
-      setResults(await api.plexSearch(q.trim()));
+      setResults(await lib.search(q.trim()));
     } catch (e) {
       setError((e as Error).message);
-      setResults(null);
+    } finally {
+      setSearching(false);
     }
   };
 
-  const mode = choice?.mode;
-  const listed: { track: Track; live?: boolean }[] = results?.map((t) => ({ track: t })) ?? choice?.candidates ?? [];
-  const current = choice?.current;
+  const mode = loaded?.mode;
+  const listed: { track: Track; live?: boolean }[] = results?.map((t) => ({ track: t })) ?? loaded?.candidates ?? [];
+  const current = loaded?.current;
   return (
     <>
-      {choice && (
+      {!on && (
+        <p className="small warn-text" style={{ margin: "0 8px 10px" }}>
+          {name} is turned off in Settings → Audio sources, so nothing plays from it until it's on again.
+        </p>
+      )}
+      {loaded && (
         <div className="row gap wrap" style={{ margin: "0 8px 10px" }}>
-          <button
-            className={`btn small ${mode === "auto" ? "" : "ghost"}`}
-            disabled={busy || mode === "auto"}
-            onClick={() => run(() => api.plexClearMatch(track.videoId, "auto"), "Back to automatic Plex matching")}
-            title="Let the app pick the Plex copy"
-          >
-            Automatic
-          </button>
-          <button
-            className={`btn small ${mode === "off" ? "" : "ghost"}`}
-            disabled={busy || mode === "off"}
-            onClick={() => run(() => api.plexClearMatch(track.videoId, "off"), "Won't play from Plex")}
-            title="Play this song from the audio cache or YouTube instead"
-          >
-            Don't use Plex
-          </button>
+          {mode !== "auto" && (
+            <button
+              className="btn small ghost"
+              disabled={busy}
+              onClick={() => run(() => lib.clearMatch(track.videoId, "auto"), `Back to automatic ${name} matching`)}
+              title={`Let the app pick the ${name} copy`}
+            >
+              Back to automatic
+            </button>
+          )}
+          {mode !== "off" && (
+            <button
+              className="btn small ghost"
+              disabled={busy}
+              onClick={() => run(() => lib.clearMatch(track.videoId, "off"), `Won't play from ${name}`)}
+              title="Play this song from the next source in Settings → Audio sources"
+            >
+              Never use {name} for this song
+            </button>
+          )}
         </div>
       )}
       <p className="small muted" style={{ margin: "0 8px 10px" }}>
         {mode === "off"
-          ? "Never plays from Plex. Pick a track below to change that."
+          ? `Never plays from ${name}. Pick a track below to change that.`
           : mode === "picked"
-            ? "Plays the Plex track you picked. “Automatic” lets the app choose again."
+            ? `Plays the ${name} track you picked. “Back to automatic” lets the app choose again.`
             : current
-              ? "Plays the highlighted Plex track. Pick another to always use that one."
-              : choice
-                ? "No Plex copy matched automatically. Pick one to use it."
+              ? `Plays the highlighted ${name} track when ${name} is its first source. Pick another to always use that one.`
+              : loaded
+                ? `No ${name} copy matched automatically. Pick one to use it.`
                 : ""}
       </p>
       <form
@@ -472,24 +546,25 @@ function PlexPane({ track, choice, onDone }: { track: Track; choice: PlexChoice 
           search();
         }}
       >
-        <input className="input grow" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search Plex" />
-        <button className="btn" type="submit">
-          Search Plex
+        <input className="input grow" value={q} onChange={(e) => setQ(e.target.value)} aria-label={`Search ${name}`} />
+        <button className="btn" type="submit" disabled={searching}>
+          {searching ? "Searching…" : `Search ${TAB_LABELS[source]}`}
         </button>
       </form>
-      {error && <p className="error small">{error}</p>}
-      {!choice && !error && <div className="spinner" />}
+      {(error || loadError) && <p className="error small">{error ?? loadError}</p>}
+      {((!choice && !error) || (searching && !results)) && <div className="spinner" />}
       <div className="sheet-list">
         {listed.map(({ track: t, live }) => {
-          const isCurrent = mode !== "off" && current === t.videoId.slice("plex_".length);
+          const isCurrent = mode !== "off" && !!current && current === itemId(t);
           return (
             <div key={t.videoId} className={`match-row ${isCurrent ? "current" : ""}`}>
               <button className="track-main" disabled={busy || isCurrent} onClick={() => use(t)} title={isCurrent ? "Plays from this now" : "Use this version"}>
-                <Cover src={t.thumbnail} size={44} />
+                <Cover src={t.thumbnail} size={44} videoId={t.videoId} />
                 <div className="track-text">
                   <div className="track-title">{t.title}</div>
                   <div className="track-sub">
-                    {t.album ?? t.artist} · {fmtTime(t.duration)}
+                    {t.album ? `${t.album} · ` : ""}
+                    {t.artist} · {fmtTime(t.duration)}
                     {live ? " · live" : ""}
                   </div>
                 </div>
@@ -504,7 +579,9 @@ function PlexPane({ track, choice, onDone }: { track: Track; choice: PlexChoice 
             </div>
           );
         })}
-        {choice && listed.length === 0 && <p className="muted small">Nothing in Plex for that. Try a shorter search (just the title).</p>}
+        {(results || loaded) && listed.length === 0 && (
+          <p className="muted small">Nothing in {name} for that. Try a shorter search (just the title).</p>
+        )}
       </div>
     </>
   );

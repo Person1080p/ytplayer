@@ -21,11 +21,11 @@ type State = {
   nowPlayingOpen: boolean;
   menuTrack: Track | null;
   playlistPickerTracks: Track[] | null;
-  /** Song whose Plex version is being chosen (see PlexVersionSheet). */
+  /** Song whose audio source is being chosen (see AudioSourceSheet). */
   plexMatchTrack: Track | null;
   toast: { id: number; text: string } | null;
   importTick: number;
-  /** Songs nothing can play right now (no Plex copy, no YouTube match, or the video is gone). */
+  /** Songs nothing can play right now (no library copy, no YouTube match, or the video is gone). */
   missing: Set<string>;
 
   setQueue: (q: Queue) => void;

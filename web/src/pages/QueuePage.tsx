@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type HistoryEntry } from "../lib/api";
+import { api, SOURCE_LABELS, type AudioSource, type HistoryEntry } from "../lib/api";
 import { jumpTo, playRadio, queueOp } from "../lib/player";
 import { useStore } from "../lib/store";
 import { CloseIcon, DragIcon, ListIcon, ShuffleIcon, TrashIcon } from "../components/Icons";
@@ -131,7 +131,9 @@ export default function QueuePage() {
               trailing={
                 <span className="muted small" title={h.scrobbled ? "Scrobbled" : ""}>
                   {new Date(h.playedAt * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                  {h.source === "plex" ? " · Plex" : h.source === "cache" ? " · Cached" : ""}
+                  {h.source && h.source !== "youtube" && h.source in SOURCE_LABELS
+                    ? ` · ${SOURCE_LABELS[h.source as AudioSource]}`
+                    : ""}
                   {h.scrobbled ? " ✓" : ""}
                 </span>
               }

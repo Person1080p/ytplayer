@@ -8,6 +8,7 @@ use crate::{
     db::Db,
     services::{
         audiocache::AudioCache,
+        jellyfin::Jellyfin,
         lastfm::LastFm,
         playback::PlaySession,
         plex::Plex,
@@ -39,6 +40,7 @@ pub struct AppState {
     /// Short-lived MP3 copies of YouTube tracks (the "cache" audio source).
     pub audio_cache: Arc<AudioCache>,
     pub plex: Plex,
+    pub jellyfin: Jellyfin,
     pub lastfm: LastFm,
     pub queue: Mutex<Queue>,
     pub sessions: Mutex<HashMap<String, PlaySession>>,

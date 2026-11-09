@@ -6,6 +6,9 @@ import { enqueue, playRadio } from "../lib/player";
 import { TrackList, Cover } from "../components/TrackRow";
 import { SearchIcon } from "../components/Icons";
 import { Card, itemLink, ShelfView } from "../components/Shelf";
+import { useYoutubeOn } from "../lib/serverStatus";
+import { folderActive, localApi } from "../lib/localFolder";
+import { normalize, primaryArtist } from "../lib/matching";
 
 type Tab = "all" | SearchFilter;
 const TABS: { id: Tab; label: string }[] = [
@@ -46,18 +49,37 @@ function Grid({ items }: { items: HomeItem[] }) {
   );
 }
 
+/** Songs from the music folder on this device (when it's set up and on). */
+function folderSongs(query: string): Promise<Track[]> {
+  return folderActive() ? localApi.search(query).catch(() => []) : Promise.resolve([]);
+}
+
+/** The folder's songs first, without the server's copies of the same songs. */
+function withFolder(r: SearchResults, local: Track[]): SearchResults {
+  if (!local.length) return r;
+  const key = (t: Track) => `${primaryArtist(t.artist)}|${normalize(t.title)}`;
+  const seen = new Set(local.map(key));
+  return { ...r, songs: [...local, ...r.songs.filter((t) => !seen.has(key(t)))] };
+}
+
+const NO_RESULTS: SearchResults = { top: null, songs: [], artists: [], albums: [], playlists: [], videos: [] };
+
 export default function Search() {
   const nav = useNavigate();
   const [params, setParams] = useSearchParams();
   const [q, setQ] = useState(params.get("q") ?? "");
-  const [tab, setTab] = useState<Tab>((params.get("tab") as Tab) || "all");
+  const [pickedTab, setTab] = useState<Tab>((params.get("tab") as Tab) || "all");
+  // With YouTube off, search covers the songs in your libraries only (no artists or albums).
+  const youtube = useYoutubeOn();
+  const tabs = youtube ? TABS : TABS.filter((t) => t.id === "all" || t.id === "songs");
+  const tab: Tab = tabs.some((t) => t.id === pickedTab) ? pickedTab : "all";
   const [results, setResults] = useState<SearchResults | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const input = useRef<HTMLInputElement>(null);
   // A YouTube link in the box: playlists, albums and channels open directly; a video is shown
   // as the one result (playing needs a tap, which iOS requires anyway).
-  const link = useMemo(() => parseYouTubeLink(q), [q]);
+  const link = useMemo(() => (youtube ? parseYouTubeLink(q) : null), [q, youtube]);
   const [linkTrack, setLinkTrack] = useState<Track | null>(null);
 
   useEffect(() => {
@@ -103,10 +125,17 @@ export default function Search() {
       setLoading(true);
       setError(null);
       setParams(tab === "all" ? { q: query } : { q: query, tab }, { replace: true });
+      const local = tab === "all" || tab === "songs" ? folderSongs(query) : Promise.resolve([]);
       api
         .searchAll(query, tab === "all" ? undefined : tab, ctrl.signal)
-        .then(setResults)
-        .catch((e) => e.name !== "AbortError" && !isNotConnected(e) && setError(e.message))
+        .then(async (res) => !ctrl.signal.aborted && setResults(withFolder(res, await local)))
+        .catch(async (e) => {
+          if (e.name === "AbortError") return;
+          // The server couldn't search (e.g. every source of its own is off): the folder may still have it.
+          const songs = await local;
+          if (songs.length) return setResults({ ...NO_RESULTS, songs });
+          if (!isNotConnected(e)) setError(e.message);
+        })
         .finally(() => setLoading(false));
     }, 350);
     return () => {
@@ -129,7 +158,7 @@ export default function Search() {
           ref={input}
           className="input"
           type="search"
-          placeholder="Songs, artists, albums, or a YouTube link"
+          placeholder={youtube ? "Songs, artists, albums, or a YouTube link" : "Songs in your libraries"}
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => {
@@ -161,7 +190,7 @@ export default function Search() {
       )}
       {q.trim() && !link && (
         <div className="tabs search-tabs" role="tablist">
-          {TABS.map((t) => (
+          {tabs.map((t) => (
             <button
               key={t.id}
               role="tab"
@@ -176,9 +205,12 @@ export default function Search() {
       )}
       {loading && <div className="spinner" />}
       {error && <p className="error">{error}</p>}
-      {r?.fallback && (
+      {r && !youtube && (
+        <p className="notice small">YouTube is off (Settings → Audio sources), so these are songs from your libraries.</p>
+      )}
+      {r?.fallback && youtube && (
         <p className="notice small" title={r.fallback}>
-          YouTube search isn't working right now, so these are songs from your Plex library and the server's audio cache.
+          YouTube search isn't working right now, so these are songs from your libraries and the server's audio cache.
         </p>
       )}
 
@@ -223,10 +255,11 @@ export default function Search() {
       {r && tab === "artists" && <Grid items={artists} />}
       {r && tab === "albums" && <Grid items={albums} />}
 
-      {!loading && empty && !error && <p className="muted">{r?.fallback ? "Nothing matching in Plex or the audio cache." : "No results."}</p>}
+      {!loading && empty && !error && <p className="muted">{!youtube ? "Nothing matching in your libraries." : r?.fallback ? "Nothing matching in your libraries or the audio cache." : "No results."}</p>}
       {!q && (
         <p className="muted">
-          Find songs, artists and albums. Tapping a song plays it with an automatic radio; use ⋯ to queue it instead.
+          {youtube ? "Find songs, artists and albums." : "Find songs in your libraries."} Tapping a song plays it with an automatic
+          radio; use ⋯ to queue it instead.
         </p>
       )}
     </div>

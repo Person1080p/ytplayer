@@ -17,7 +17,9 @@ use crate::{
         audiocache,
         importers,
         playback::{self, PlaybackEvent},
+        jellyfin::JellyfinInfo,
         plex::{self, MatchMode, PlexPin, PlexServer, PlexTrack},
+        sources::{self, SourcePref},
         tailscale::{self, TailscaleInfo},
         ytauth, ytlog,
         ytmusic::{pace_base_ms, ACCOUNT_KEY, DEFAULT_IMPORT_PACE, IMPORT_PACE_KEY, COOKIE_SOURCE_KEY, COOKIE_SYNCED_KEY},
@@ -40,16 +42,44 @@ pub struct Status {
     lastfm: Value,
     spotify: Value,
     deezer: Value,
+    jellyfin: JellyfinInfo,
     prefs: Prefs,
     audio_cache: audiocache::Stats,
     tailscale: TailscaleInfo,
     public_url: String,
+    version: Version,
+}
+
+/// The git commit the server was built from (set by build.rs; unknown without git).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Version {
+    commit: Option<&'static str>,
+    commit_short: Option<&'static str>,
+    /// Built with uncommitted changes.
+    dirty: bool,
+    /// Unix time of the build.
+    built_at: Option<i64>,
+}
+
+fn version() -> Version {
+    let commit = option_env!("YTP_GIT_COMMIT").filter(|c| !c.is_empty());
+    Version {
+        commit,
+        commit_short: commit.map(|c| &c[..c.len().min(7)]),
+        dirty: option_env!("YTP_GIT_DIRTY") == Some("1"),
+        built_at: option_env!("YTP_BUILT_AT").and_then(|t| t.parse().ok()),
+    }
 }
 
 pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiResult<Status> {
-    let (ytdlp_path, ytdlp_version) = match st.ytdlp.binary().await {
-        Ok(p) => (Some(p.display().to_string()), st.ytdlp.version().await.ok()),
-        Err(_) => (None, None),
+    // With YouTube off, yt-dlp isn't run (or fetched) at all.
+    let (ytdlp_path, ytdlp_version) = match sources::youtube_enabled(&st.db).await {
+        true => match st.ytdlp.binary().await {
+            Ok(p) => (Some(p.display().to_string()), st.ytdlp.version().await.ok()),
+            Err(_) => (None, None),
+        },
+        false => (None, None),
     };
     let plex = st.plex.server().await;
     let lastfm_session = st.lastfm.session().await;
@@ -80,6 +110,8 @@ pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiRes
         }),
         plex: json!({
             "connected": plex.is_some(),
+            // Connected and on in Settings → Audio sources.
+            "enabled": st.plex.enabled().await,
             "url": plex.map(|(u, _)| u),
             "loggedIn": st.db.get_setting("plex.account_token").await?.is_some(),
         }),
@@ -95,10 +127,12 @@ pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiRes
             "exportDirSet": st.db.get_setting(crate::services::spotify::EXPORT_DIR_KEY).await?.is_some(),
         }),
         deezer: json!({ "userId": st.db.get_setting("deezer.user_id").await? }),
+        jellyfin: st.jellyfin.info().await,
         prefs: load_prefs(&st).await,
         audio_cache: st.audio_cache.stats().await,
         tailscale: ts,
         public_url: base_url(&st, &headers).await,
+        version: version(),
     }))
 }
 
@@ -112,7 +146,10 @@ pub async fn update_ytdlp(State(st): State<SharedState>) -> ApiResult<Value> {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Prefs {
-    prefer_plex: bool,
+    /// Audio sources in priority order, all four (`[{id, on}]`). Apps that don't send it (older
+    /// ones) leave it as it is. (The old `preferPlex` is ignored if sent.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sources: Option<Vec<SourcePref>>,
     scrobble: bool,
     report_youtube: bool,
     #[serde(default = "yes")]
@@ -128,6 +165,9 @@ pub struct Prefs {
     /// Hours MP3 copies of YouTube plays are kept and used (0: off, -1: forever).
     #[serde(default = "default_cache_hours")]
     audio_cache_hours: i32,
+    /// Deezer favourites import shown in Library → Import.
+    #[serde(default)]
+    deezer: bool,
 }
 
 fn default_cache_hours() -> i32 {
@@ -154,7 +194,7 @@ fn off() -> String {
 
 async fn load_prefs(st: &SharedState) -> Prefs {
     Prefs {
-        prefer_plex: st.db.get_bool("prefs.prefer_plex", true).await,
+        sources: Some(sources::prefs(&st.db).await),
         scrobble: st.db.get_bool("prefs.scrobble", true).await,
         report_youtube: st.db.get_bool("prefs.report_youtube", true).await,
         love_on_lastfm: st.db.get_bool("prefs.love_on_lastfm", true).await,
@@ -162,8 +202,12 @@ async fn load_prefs(st: &SharedState) -> Prefs {
         log_youtube: ytlog::enabled(),
         import_pace: import_pace(st).await,
         audio_cache_hours: st.audio_cache.hours(),
+        // On by default for whoever has imported from Deezer before.
+        deezer: st.db.get_bool(DEEZER_PREF, matches!(st.db.get_setting("deezer.user_id").await, Ok(Some(_)))).await,
     }
 }
+
+const DEEZER_PREF: &str = "prefs.deezer";
 
 pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> ApiResult<Prefs> {
     if pace_base_ms(&p.import_pace).is_none() {
@@ -176,7 +220,12 @@ pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> A
             audiocache::FOREVER
         )));
     }
-    st.db.set_setting("prefs.prefer_plex", if p.prefer_plex { "1" } else { "0" }).await?;
+    if let Some(list) = &p.sources {
+        sources::validate(list).map_err(AppError::bad)?;
+    }
+    if let Some(list) = p.sources {
+        sources::set_prefs(&st.db, list).await?;
+    }
     st.db.set_setting("prefs.scrobble", if p.scrobble { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.report_youtube", if p.report_youtube { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.love_on_lastfm", if p.love_on_lastfm { "1" } else { "0" }).await?;
@@ -190,6 +239,7 @@ pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> A
     st.db.set_setting(IMPORT_PACE_KEY, &p.import_pace).await?;
     st.yt.set_pace(&p.import_pace);
     st.audio_cache.set_hours(p.audio_cache_hours).await?;
+    st.db.set_setting(DEEZER_PREF, if p.deezer { "1" } else { "0" }).await?;
     Ok(Json(load_prefs(&st).await))
 }
 

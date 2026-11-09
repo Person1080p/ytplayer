@@ -105,10 +105,15 @@ pub const SYNC_ERROR_KEY: &str = "ytmusic.cookie_sync_error";
 /// Periodically refresh a browser-sourced cookie from the same browser. Purely opportunistic:
 /// nothing waits for it, and when the browser can't be read (e.g. it isn't installed where the
 /// server runs) the saved sign-in simply keeps being used for as long as YouTube accepts it.
+/// Skipped while YouTube is turned off.
 pub fn spawn_sync_loop(state: SharedState) {
     tokio::spawn(crate::services::ytlog::with_origin("cookie sync loop", async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
+            if !crate::services::sources::youtube_enabled(&state.db).await {
+                tokio::time::sleep(SYNC_EVERY).await;
+                continue;
+            }
             if let Err(e) = sync_once(&state).await {
                 tracing::info!("couldn't refresh the YouTube Music sign-in from the browser ({e:#}); still using the saved one");
             }

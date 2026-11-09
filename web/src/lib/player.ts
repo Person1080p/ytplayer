@@ -14,6 +14,7 @@
 // background, so there a single element is kept and only the download is done ahead.
 
 import { api, bumpSourceRev, fetchAudio, randomId, streamUrl, type AudioSource, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
+import { invalidateLocal, localUrl, needsDecision, prepareLocal, skipLocal } from "./localFolder";
 import { useStore } from "./store";
 import { apiFetch, detectConnection, isTailnet } from "./transport";
 import { loadProfile } from "./profile";
@@ -243,10 +244,12 @@ function reloadAtPosition(play = true) {
   if (!it || it.track.videoId !== activeVideoId) return;
   const el = audio;
   const at = el.currentTime;
-  const url = streamUrl(it.track.videoId);
+  const local = localUrl(it.track.videoId);
+  const url = local ?? streamUrl(it.track.videoId);
   el.src = url;
   assign(el, it.track.videoId, url);
-  fetchSource(el, it.track.videoId, loadToken);
+  if (local) set({ source: "local", streamKbps: null });
+  else fetchSource(el, it.track.videoId, loadToken);
   quiet();
   el.addEventListener("loadedmetadata", () => audio === el && (el.currentTime = at), { once: true });
   if (play) el.play().catch(() => {});
@@ -259,6 +262,7 @@ function reloadAtPosition(play = true) {
  */
 export function reloadSource(videoId: string) {
   bumpSourceRev(videoId);
+  invalidateLocal(videoId);
   for (const [k, v] of blobs) {
     if (!k.startsWith(`${videoId}|`) && !k.startsWith(`${videoId}pipe|`)) continue;
     if (!els.some((el) => el.src === v.url)) URL.revokeObjectURL(v.url);
@@ -271,7 +275,19 @@ export function reloadSource(videoId: string) {
   const it = current();
   if (!it || it.track.videoId !== videoId || activeVideoId !== videoId) return;
   const play = !audio.paused;
-  if (!isTailnet()) return reloadAtPosition(play);
+  // The music folder on this device may have it now (or not any more): decide again first.
+  if (needsDecision(videoId)) {
+    void prepareLocal(it.track).then(() => switchSource(videoId, play));
+    return;
+  }
+  switchSource(videoId, play);
+}
+
+/** Load `videoId` (the song playing) again from wherever it plays from now, at the same spot. */
+function switchSource(videoId: string, play: boolean) {
+  const it = current();
+  if (!it || it.track.videoId !== videoId || activeVideoId !== videoId) return;
+  if (!isTailnet() || localUrl(videoId)) return reloadAtPosition(play);
   const el = audio;
   const at = el.currentTime;
   const old = el.src;
@@ -404,15 +420,27 @@ function setSrc(track: Track, autoplay: boolean, fadeSeconds = 0) {
   updateMediaSession(track);
   scheduleWarmNext();
   quiet();
+  // Whether it plays from the music folder on this device is decided first (only when one is set
+  // up and on; the server is asked about the sources ahead of it).
+  if (needsDecision(track.videoId)) {
+    void prepareLocal(track).then(() => token === loadToken && loadSrc(track, autoplay, fadeSeconds, token));
+    return;
+  }
+  loadSrc(track, autoplay, fadeSeconds, token);
+}
+
+function loadSrc(track: Track, autoplay: boolean, fadeSeconds: number, token: number) {
   if (dual) return setSrcDual(track, autoplay, fadeSeconds, token);
 
-  if (!isTailnet()) {
-    const url = streamUrl(track.videoId);
+  const local = localUrl(track.videoId);
+  if (local || !isTailnet()) {
+    const url = local ?? streamUrl(track.videoId);
     audio.src = url;
     assign(audio, track.videoId, url);
     activeVideoId = track.videoId;
     if (autoplay) audio.play().catch(() => {});
-    fetchSource(audio, track.videoId, token);
+    if (local) set({ source: "local", streamKbps: null });
+    else fetchSource(audio, track.videoId, token);
     return;
   }
 
@@ -447,11 +475,13 @@ function setSrcDual(track: Track, autoplay: boolean, fadeSeconds: number, token:
     activate(el, track.videoId, autoplay, fadeSeconds);
     return;
   }
-  if (!isTailnet()) {
-    const url = streamUrl(track.videoId);
+  const local = localUrl(track.videoId);
+  if (local || !isTailnet()) {
+    const url = local ?? streamUrl(track.videoId);
     el.src = url;
     assign(el, track.videoId, url);
-    fetchSource(el, track.videoId, token);
+    if (local) set({ source: "local" });
+    else fetchSource(el, track.videoId, token);
     activate(el, track.videoId, autoplay, fadeSeconds);
     return;
   }
@@ -534,7 +564,13 @@ function maybePreload() {
   if (!n) return;
   const videoId = n.track.videoId;
   const el = spareEl();
-  const key = streamUrl(videoId); // includes the quality budget
+  if (needsDecision(videoId)) {
+    // Decide (music folder or server) once the current song has loaded, then preload.
+    if (currentLoaded()) void prepareLocal(n.track).then(() => maybePreload());
+    return;
+  }
+  const local = localUrl(videoId);
+  const key = local ?? streamUrl(videoId); // includes the quality budget
   if (spare && spare.el === el && spare.videoId === videoId) {
     // Already preloaded. Redo it only if the quality budget changed and it isn't fully loaded yet.
     const full = isFinite(el.duration) && loadedFromStart(el) >= el.duration - 1;
@@ -543,6 +579,14 @@ function maybePreload() {
   if (!currentLoaded()) return;
   const entry: NonNullable<typeof spare> = { el, videoId, key, ready: false };
   spare = entry;
+  if (local) {
+    el.src = local;
+    assign(el, videoId, local);
+    el.load();
+    entry.ready = true;
+    entry.source = "local";
+    return;
+  }
   if (!isTailnet()) {
     el.src = key;
     assign(el, videoId, key);
@@ -679,6 +723,8 @@ function scheduleWarmNext() {
       const q = get().queue;
       const next = q?.items[q.index + 1];
       if (!next) return;
+      if (needsDecision(next.track.videoId)) void prepareLocal(next.track);
+      if (localUrl(next.track.videoId)) return;
       if (isTailnet()) {
         loadBlob(next.track.videoId).catch(() => {});
       } else {
@@ -761,6 +807,13 @@ on("ended", () => {
 on("error", () => {
   const it = current();
   if (!it || !audio.src) return;
+  const local = localUrl(it.track.videoId);
+  if (local && audio.src === local) {
+    // The file in the music folder couldn't be played (moved, unreadable): the server plays it.
+    skipLocal(it.track.videoId);
+    setSrc(it.track, true);
+    return;
+  }
   if (!triedFallback) {
     // Retry through yt-dlp's pipe mode (no seeking, but robust).
     triedFallback = true;

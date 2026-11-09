@@ -1,6 +1,6 @@
 import { useNavigate } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
-import { api, fmtTime, type AudioSource, type Track } from "../lib/api";
+import { api, fmtTime, SOURCE_LABELS, type Track } from "../lib/api";
 import { setLiked, useLibrary } from "../lib/library";
 import { next, playRadio, previous, seek, setVolume, toggle, volumeAdjustable } from "../lib/player";
 import { currentTrack, useStore } from "../lib/store";
@@ -21,6 +21,7 @@ import {
 } from "./Icons";
 import { artUrl, Cover } from "./TrackRow";
 import { artistLink } from "./Shelf";
+import { useYoutubeOn } from "../lib/serverStatus";
 
 /** ♥: filled when the track is in your library or loved on Last.fm; toggles both. */
 export function HeartButton({ track, size = 22 }: { track: Track; size?: number }) {
@@ -57,14 +58,12 @@ export function HeartButton({ track, size = 22 }: { track: Track; size?: number 
   );
 }
 
-const SOURCE_NAMES: Record<AudioSource, string> = { plex: "Plex", cache: "Cached", youtube: "YouTube" };
-
 function SourceBadge() {
   const source = useStore((s) => s.source);
   const kbps = useStore((s) => s.streamKbps);
   const budget = useStore((s) => s.qualityBudget);
   if (!source) return null;
-  const name = SOURCE_NAMES[source];
+  const name = SOURCE_LABELS[source] ?? source;
   const tip = [source === "cache" ? "MP3 copy the server kept from a recent YouTube play" : "", kbps ? `${kbps} kbps` : ""]
     .filter(Boolean)
     .join(" · ");
@@ -292,6 +291,7 @@ export function NowPlaying() {
   const buffering = useStore((s) => s.buffering);
   const openMenu = useStore((s) => s.openMenu);
   const nav = useNavigate();
+  const youtube = useYoutubeOn();
   if (!isOpen || !track) return null;
 
   return (
@@ -315,16 +315,21 @@ export function NowPlaying() {
       <div className="np-meta">
         <h2>{track.title}</h2>
         <p>
-          <button
-            className="link-btn"
-            onClick={() => {
-              setOpen(false);
-              nav(artistLink(track.artist));
-            }}
-            title="Go to artist"
-          >
-            {track.artist}
-          </button>
+          {youtube ? (
+            <button
+              className="link-btn"
+              onClick={() => {
+                setOpen(false);
+                nav(artistLink(track.artist));
+              }}
+              title="Go to artist"
+            >
+              {track.artist}
+            </button>
+          ) : (
+            // Artist pages come from YouTube Music, which is off.
+            track.artist
+          )}
           {track.album ? ` · ${track.album}` : ""}
         </p>
         <SourceBadge />

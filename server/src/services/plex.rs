@@ -180,8 +180,10 @@ impl Plex {
         Some((url, token))
     }
 
+    /// Connected, and on in Settings → Audio sources.
     pub async fn enabled(&self) -> bool {
-        self.server().await.is_some() && self.db.get_bool("prefs.prefer_plex", true).await
+        use crate::services::sources;
+        self.server().await.is_some() && sources::order(&self.db).await.contains(&sources::Source::Plex)
     }
 
     async fn plex_tv(&self, method: reqwest::Method, path: &str, token: Option<&str>) -> anyhow::Result<Value> {
