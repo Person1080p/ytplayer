@@ -264,6 +264,9 @@ pub struct StreamQuery {
     kbps: Option<u32>,
     #[serde(default)]
     opus: Option<u8>,
+    /// `1`: send a whole YouTube file repacked as a plain MP4 (see [`remux_youtube`]).
+    #[serde(default)]
+    remux: Option<u8>,
 }
 
 impl StreamQuery {
@@ -297,7 +300,13 @@ pub async fn stream(
     let mut failure = None;
     for &s in &song.plan {
         let tried = match s {
-            Source::Youtube => youtube_stream(&st, &video_id, range.clone(), quality, YoutubeMode::from_via(q.via.as_deref())).await,
+            Source::Youtube => {
+                let mode = match YoutubeMode::from_via(q.via.as_deref()) {
+                    YoutubeMode::Any if q.remux == Some(1) && range_start(range.as_ref()) == 0 => YoutubeMode::Remux,
+                    m => m,
+                };
+                youtube_stream(&st, &video_id, range.clone(), quality, mode).await
+            }
             lib => match song.item(lib).await {
                 Tried::Played(item) => library_stream(&song, item, range.clone(), quality).await,
                 Tried::NotThere => Tried::NotThere,
@@ -357,6 +366,8 @@ enum YoutubeMode {
     Pipe,
     /// Only YouTube's file (an HLS playlist's byte ranges point into it).
     File,
+    /// The cached MP3, else YouTube's whole file repacked as a plain MP4, else as [`Self::Any`].
+    Remux,
 }
 
 impl YoutubeMode {
@@ -418,7 +429,7 @@ async fn youtube_stream(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             // Copy what passes through into the audio cache, at the High level only.
-            let tee = (quality.level() == AudioLevel::High).then(|| Tee {
+            let mut tee = (quality.level() == AudioLevel::High).then(|| Tee {
                 cache: &st.audio_cache,
                 video_id,
                 meta: audiocache::Meta {
@@ -428,6 +439,12 @@ async fn youtube_stream(
                     thumbnail: resolved.thumbnail.clone(),
                 },
             });
+            if mode == YoutubeMode::Remux && resolved.mime == "audio/mp4" {
+                match remux_youtube(st, video_id, &resolved, &extra, range.clone(), tee.take()).await {
+                    Ok(resp) => return Tried::Played(with_kbps(with_source(resp, "youtube"), resolved.kbps)),
+                    Err(e) => tracing::warn!("remux of {video_id} failed, sending it as it is: {e:#}"),
+                }
+            }
             match proxy_youtube(&st.http, &resolved.url, range.clone(), &extra, &resolved.mime, tee).await {
                 Ok(resp) => return Tried::Played(with_kbps(with_source(resp, "youtube"), resolved.kbps)),
                 Err(e) => {
@@ -671,6 +688,61 @@ impl Mp4Index {
         out.push_str("#EXT-X-ENDLIST\n");
         out
     }
+}
+
+/// YouTube's audio file repacked as a plain MP4 (one index up front instead of fragments; same
+/// audio, `ffmpeg -c copy`). For the in-page tailnet player, which downloads a song whole and plays
+/// it from memory, so it can't use the HLS playlist: Safari misjudges a fragmented file's length
+/// (twice the real one), but reads a plain MP4's right. Takes about a second for an hour of audio.
+async fn remux_youtube(
+    st: &SharedState,
+    video_id: &str,
+    resolved: &crate::services::ytdlp::ResolvedStream,
+    extra: &[(String, String)],
+    range: Option<HeaderValue>,
+    tee: Option<Tee<'_>>,
+) -> anyhow::Result<Response> {
+    let ffmpeg = st.audio_cache.ffmpeg().ok_or_else(|| anyhow::anyhow!("ffmpeg not found"))?.to_path_buf();
+    let dir = std::env::temp_dir();
+    let stem = format!("ytp-remux-{video_id}-{}", uuid::Uuid::new_v4().simple());
+    let (input, output) = (dir.join(format!("{stem}.in.mp4")), dir.join(format!("{stem}.mp4")));
+    let result = async {
+        // The whole file, in fast pieces (see YT_CHUNK).
+        let resp = proxy_youtube(&st.http, &resolved.url, None, extra, &resolved.mime, tee).await?;
+        let mut body = resp.into_body().into_data_stream();
+        let mut f = tokio::fs::File::create(&input).await?;
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = body.next().await {
+            f.write_all(&chunk.map_err(|e| anyhow::anyhow!("{e}"))?).await?;
+        }
+        f.flush().await?;
+        drop(f);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            tokio::process::Command::new(&ffmpeg)
+                .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i"])
+                .arg(&input)
+                .args(["-map", "0:a", "-c", "copy", "-movflags", "+faststart", "-f", "mp4"])
+                .arg(&output)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ffmpeg timed out"))??;
+        if !out.status.success() {
+            anyhow::bail!("ffmpeg: {}", String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>());
+        }
+        // Opened by the response before the file is removed below (its data stays readable).
+        serve_file(output.clone(), range).await.ok_or_else(|| anyhow::anyhow!("remuxed file vanished"))
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&input).await;
+    let _ = tokio::fs::remove_file(&output).await;
+    let mut resp = result?;
+    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mp4"));
+    Ok(resp)
 }
 
 /// `x-audio-kbps`: lets the in-page tailnet player (which reads headers) know the bitrate.

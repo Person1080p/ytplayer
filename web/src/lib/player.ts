@@ -407,7 +407,7 @@ function loadBlob(videoId: string, via?: "pipe"): Promise<Loaded> {
   }
   const running = inflight.get(key);
   if (running) return running;
-  const p = fetchAudio(videoId, via)
+  const p = fetchAudio(videoId, via, undefined, !opusOk)
     .then(async (r) => {
       if (!r.ok) throw new Error(`stream failed (${r.status})`);
       const source = (r.headers.get("x-audio-source") as Loaded["source"]) ?? null;

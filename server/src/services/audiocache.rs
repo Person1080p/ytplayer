@@ -185,6 +185,11 @@ impl AudioCache {
         files.extend(found.into_iter().map(|(id, (path, _))| (id, path)));
     }
 
+    /// The ffmpeg this server found, if any.
+    pub fn ffmpeg(&self) -> Option<&Path> {
+        self.ffmpeg.as_deref()
+    }
+
     pub fn hours(&self) -> i32 {
         self.hours.load(Ordering::Relaxed)
     }

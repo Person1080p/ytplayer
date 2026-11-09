@@ -535,9 +535,9 @@ function withArgs(path: string, args: string[]) {
 }
 
 /** `/stream/:id` with the current quality budget (see quality.ts). */
-function streamPath(videoId: string, via?: "youtube" | "pipe") {
+function streamPath(videoId: string, via?: "youtube" | "pipe", extra: string[] = []) {
   const rev = sourceRevs[videoId];
-  return withArgs(`/stream/${enc(videoId)}`, [...(via ? [`via=${via}`] : []), ...qualityArgs(), ...(rev ? [`rev=${rev}`] : [])]);
+  return withArgs(`/stream/${enc(videoId)}`, [...(via ? [`via=${via}`] : []), ...qualityArgs(), ...(rev ? [`rev=${rev}`] : []), ...extra]);
 }
 
 // Songs whose audio source just changed (a Plex version picked or turned off). Their stream URLs
@@ -565,8 +565,12 @@ export function bumpSourceRev(videoId: string) {
   }
 }
 
-export function fetchAudio(videoId: string, via?: "youtube" | "pipe", signal?: AbortSignal) {
-  return apiFetch(streamPath(videoId, via), { signal });
+/**
+ * The whole song, for playing from memory (the in-page tailnet player). `remux`: YouTube's file
+ * repacked as a plain MP4, for Safari, which misjudges the length of the fragmented original.
+ */
+export function fetchAudio(videoId: string, via?: "youtube" | "pipe", signal?: AbortSignal, remux = false) {
+  return apiFetch(streamPath(videoId, via, remux && via !== "pipe" ? ["remux=1"] : []), { signal });
 }
 
 export function streamUrl(videoId: string, via?: "youtube" | "pipe") {
