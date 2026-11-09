@@ -57,7 +57,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/tracks/{video_id}/youtube/retry", post(music::retry_youtube_match))
         .route("/missing", get(music::missing))
         .route("/stream/{video_id}", get(stream::stream))
-        .route("/stream/{video_id}/hls", get(stream::hls))
+        .route("/stream/{video_id}/hls.m3u8", get(stream::hls))
         .route("/history", get(music::history))
         .route("/playback", post(settings::playback_event))
         // queue
@@ -226,7 +226,11 @@ async fn require_auth(State(st): State<SharedState>, req: Request, next: Next) -
     // OAuth providers redirect back here without our header, but browsers send the cookie.
     match token_from(req.headers(), req.uri().query()) {
         Some(t) if constant_eq(&t, expected) => next.run(req).await,
-        _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" }))).into_response(),
+        _ => {
+            // Path only: a query may carry a (wrong) token.
+            tracing::warn!("refused {} {}: no or wrong access token", req.method(), req.uri().path());
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" }))).into_response()
+        }
     }
 }
 

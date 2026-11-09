@@ -284,6 +284,9 @@ pub async fn stream(
     }
     let range = headers.get(header::RANGE).cloned();
     let quality = q.quality();
+    if q.via.as_deref() == Some("dash") && range_start(range.as_ref()) == 0 {
+        tracing::info!("hls {video_id}: player loading the header ({})", range.as_ref().and_then(|r| r.to_str().ok()).unwrap_or("no range"));
+    }
     // A Spotify song's own album art, the first time it plays (not before, to save requests).
     spotify::art_on_play(st.clone(), &video_id);
 
@@ -469,7 +472,7 @@ async fn youtube_stream(
 // the file's own index, its `sidx` box), so Safari, which plays HLS natively, starts at once and
 // can seek. Its entries are byte ranges of `/stream?via=dash`: the same file, nothing re-encoded.
 
-/// `GET /stream/{id}/hls`: an HLS playlist for the song's YouTube file, or a redirect to the
+/// `GET /stream/{id}/hls.m3u8`: an HLS playlist for the song's YouTube file, or a redirect to the
 /// plain stream when it plays from somewhere else (a library, the cached MP3) or the file has no
 /// usable index.
 pub async fn hls(
@@ -481,23 +484,30 @@ pub async fn hls(
     if !video_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || video_id.len() > 40 {
         return Err(AppError::bad("invalid video id"));
     }
-    // Relative to `/stream/{id}/hls`: `../{id}?…` is `/stream/{id}?…`, whatever prefix the app has.
+    // Relative to `/stream/{id}/hls.m3u8`: `../{id}?…` is `/stream/{id}?…`, whatever prefix the app has.
     let query = uri.query().unwrap_or("");
     let plain = if query.is_empty() { format!("../{video_id}") } else { format!("../{video_id}?{query}") };
     let redirect = || Response::builder().status(StatusCode::FOUND).header(header::LOCATION, plain.as_str()).header(header::CACHE_CONTROL, "no-store").body(Body::empty());
 
     match hls_playlist(&st, &video_id, q.quality(), query).await {
-        Some(text) => Ok(Response::builder()
+        Ok(text) => {
+            tracing::info!("hls {video_id}: playlist of {} segments", text.matches("#EXTINF").count());
+            Ok(Response::builder()
             .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
             .header(header::CACHE_CONTROL, "no-store")
             .body(Body::from(text))
-            .map_err(|e| anyhow::anyhow!(e))?),
-        None => Ok(redirect().map_err(|e| anyhow::anyhow!(e))?),
+            .map_err(|e| anyhow::anyhow!(e))?)
+        }
+        Err(why) => {
+            tracing::info!("hls {video_id}: plain stream instead ({why})");
+            Ok(redirect().map_err(|e| anyhow::anyhow!(e))?)
+        }
     }
 }
 
-/// The playlist, when the song plays from YouTube's (MP4) file right now. None: use the plain stream.
-async fn hls_playlist(st: &SharedState, video_id: &str, quality: QualityQuery, query: &str) -> Option<String> {
+/// The playlist, when the song plays from YouTube's (MP4) file right now; else why not (the plain
+/// stream is used).
+async fn hls_playlist(st: &SharedState, video_id: &str, quality: QualityQuery, query: &str) -> Result<String, String> {
     // Only when YouTube is what `/stream` would play: the first source that has the song.
     let song = Song::new(st, video_id).await;
     for &s in &song.plan {
@@ -505,21 +515,25 @@ async fn hls_playlist(st: &SharedState, video_id: &str, quality: QualityQuery, q
             Source::Youtube => break,
             lib => match song.item(lib).await {
                 Tried::NotThere => continue,
-                _ => return None,
+                _ => return Err(format!("plays from {}", lib.as_str())),
             },
         }
     }
     if !song.plan.contains(&Source::Youtube) {
-        return None;
+        return Err("YouTube is off".into());
     }
-    let youtube = youtube_video(st, video_id).await.ok()??;
+    let youtube = match youtube_video(st, video_id).await {
+        Ok(Some(v)) => v,
+        _ => return Err("no YouTube video".into()),
+    };
     if st.audio_cache.peek(&youtube, quality.cache_ok()) {
-        return None;
+        return Err("plays from the cached MP3".into());
     }
+    let mut why = String::new();
     for attempt in 0..2 {
-        let resolved = st.ytdlp.resolve(&youtube, quality.level(), quality.opus()).await.ok()?;
+        let resolved = st.ytdlp.resolve(&youtube, quality.level(), quality.opus()).await.map_err(|e| format!("yt-dlp: {e:#}"))?;
         if resolved.mime != "audio/mp4" {
-            return None;
+            return Err(format!("not MP4 ({})", resolved.mime));
         }
         match fetch_index(st, &resolved).await {
             Ok(Some(index)) => {
@@ -528,16 +542,17 @@ async fn hls_playlist(st: &SharedState, video_id: &str, quality: QualityQuery, q
                     seg.push('&');
                     seg.push_str(kv);
                 }
-                return Some(index.playlist(&seg));
+                return Ok(index.playlist(&seg));
             }
-            Ok(None) => return None,
+            Ok(None) => return Err("the file has no index".into()),
             Err(e) => {
                 tracing::warn!("hls index for {youtube} (attempt {attempt}): {e:#}");
+                why = format!("reading its index: {e:#}");
                 st.ytdlp.invalidate(&youtube).await;
             }
         }
     }
-    None
+    Err(why)
 }
 
 /// Read the start of YouTube's file and its fragment index. Ok(None): not an indexed MP4.

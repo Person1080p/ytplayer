@@ -1,4 +1,4 @@
-import { apiFetch } from "./transport";
+import { apiFetch, getToken } from "./transport";
 import { qualityArgs } from "./quality";
 
 export type Track = {
@@ -579,7 +579,11 @@ export function streamUrl(videoId: string, via?: "youtube" | "pipe") {
  */
 export function hlsUrl(videoId: string) {
   const rev = sourceRevs[videoId];
-  return `/api${withArgs(`/stream/${enc(videoId)}/hls`, [...qualityArgs(), ...(rev ? [`rev=${rev}`] : [])])}`;
+  // The token too: Safari's HLS player may not send the page's cookie. The server copies the
+  // query into the playlist's segment URLs.
+  const token = getToken();
+  const args = [...qualityArgs(), ...(rev ? [`rev=${rev}`] : []), ...(token ? [`token=${enc(token)}`] : [])];
+  return `/api${withArgs(`/stream/${enc(videoId)}/hls.m3u8`, args)}`;
 }
 
 export function fmtTime(sec?: number | null) {
