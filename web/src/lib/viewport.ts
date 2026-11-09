@@ -5,10 +5,15 @@
 // the bar's colour (`vp-short`, styles.css). Elsewhere, or once iOS gets it right, it's 0.
 
 const iosStandalone = (navigator as Navigator & { standalone?: boolean }).standalone === true;
+/**
+ * The shortfall comes with a translucent status bar (the page drawn under it). With a solid one
+ * the window is legitimately shorter than the screen by the status bar, which isn't the bug.
+ */
+const translucentBar = document.querySelector<HTMLMetaElement>('meta[name="apple-mobile-web-app-status-bar-style"]')?.content === "black-translucent";
 
 function update() {
   let gap = 0;
-  if (iosStandalone) {
+  if (iosStandalone && translucentBar) {
     // iOS reports the screen in portrait whatever the orientation.
     const landscape = window.innerWidth > window.innerHeight;
     const full = landscape ? Math.min(screen.width, screen.height) : Math.max(screen.width, screen.height);

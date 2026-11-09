@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <meta name="theme-color" content="#0f0f12" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!-- Solid, not translucent: with a translucent status bar iOS sizes the viewport fixed elements use
+         short of the screen's bottom edge (see src/lib/viewport.ts). -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <title>YTP Music</title>
