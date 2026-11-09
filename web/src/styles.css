@@ -32,18 +32,8 @@ html, body { touch-action: pan-x pan-y; }
 /* The strip below the fixed-element viewport (see --vp-gap) shows the page canvas: the tab bar's
    colour, so the bar seems to reach the screen's edge. */
 html.vp-short { background: rgb(10, 10, 13); }
-/* Fixed elements are clipped at that viewport's end, but the page itself is drawn to the screen's
-   edge. So the tab bar leaves fixed positioning: the app reaches down by the shortfall and the bar
-   sits at its bottom, with the real home-indicator inset; the page itself never scrolls. */
-html.vp-short, html.vp-short body { overflow: hidden; }
-@media (max-width: 760px) {
-  html.vp-short .app { position: relative; height: calc(100% + var(--vp-gap)); }
-  html.vp-short .bottom-nav {
-    position: absolute; height: calc(var(--nav-h) + env(safe-area-inset-bottom, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px);
-  }
-  html.vp-short .player-bar { bottom: calc(var(--nav-h) + env(safe-area-inset-bottom, 0px) - var(--vp-gap)) !important; }
-  html.vp-short .content { padding-bottom: calc(var(--bar-h) + var(--nav-h) + env(safe-area-inset-bottom, 0px) + 16px); }
-}
+/* Nothing can be drawn in that strip: iOS clips fixed elements there, and the page's own content
+   too (tried: a tab bar in the page flow, reaching down, lost its labels). Only the canvas shows. */
 body {
   margin: 0;
   background: var(--bg);
