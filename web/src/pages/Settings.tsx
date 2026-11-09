@@ -179,7 +179,18 @@ function YouTubeMusic({ status, reload }: { status: Status; reload: () => void }
               sign-in is still used, and YouTube rejecting it is what would need a new sign-in.
             </p>
           )}
+          {serverBrowser && (yt.syncError || yt.expiredSince) && (
+            <p className="small">
+              To fix it, open the server's browser, sign in at music.youtube.com there, then quit the browser from its menu (it
+              reopens by itself; quitting saves the sign-in) and press Sync now.
+            </p>
+          )}
           <div className="row gap wrap">
+            {serverBrowser && (yt.syncError || yt.expiredSince) && (
+              <a className="btn small" href={serverBrowser} target="_blank" rel="noreferrer">
+                Open the server's browser
+              </a>
+            )}
             {synced && (
               <button
                 className="btn ghost small"

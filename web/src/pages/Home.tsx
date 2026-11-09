@@ -178,10 +178,13 @@ function tokenProblem(y: Status["ytmusic"]): string | null {
   const refresh = browser
     ? `Refreshing it from ${BROWSER_NAMES[browser] ?? browser} on the server failed too: ${y.syncError}`
     : "It was pasted in by hand, so it can't refresh itself.";
+  const fix = y.signinBrowserUrl
+    ? "Click to open Settings, then sign in again in the server's browser."
+    : "Click to sign in again in Settings.";
   return (
     `Your YouTube Music sign-in has expired: since ${since}, YouTube treats the app as a signed-out visitor, ` +
     `so Home shows general picks instead of your mixes, and your likes and history aren't used. ${refresh} ` +
-    `Click to sign in again in Settings.`
+    fix
   );
 }
 
