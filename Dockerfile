@@ -16,16 +16,19 @@ RUN GOOS=js GOARCH=wasm go build -tags "$(go run ./internal/tags)" -trimpath -ld
  && cp "$js" /out/
 
 FROM node:22-bookworm-slim AS web
-ARG GIT_COMMIT
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
+# Declared after npm ci: a new commit shouldn't reinstall the packages.
+ARG GIT_COMMIT
 COPY web/ ./
 COPY --from=tailnet /out/ public/tailnet/
 RUN YTP_COMMIT="$GIT_COMMIT" npm run build
 
+# The commit isn't passed to this stage (the server reads it from the image, see the last stage),
+# so it stays cached when server/ is unchanged; target/ is kept between builds, so a server change
+# recompiles only the server itself, not every dependency.
 FROM rust:1.99.1-bookworm AS server
-ARG GIT_COMMIT
 # Go builds the embedded Tailscale node (server/tsnet-ffi) as a C archive linked into the server.
 COPY --from=golang:1.27.3-bookworm /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:$PATH
@@ -33,7 +36,8 @@ WORKDIR /src/server
 COPY server/ ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/root/go/pkg/mod \
-    YTP_GIT_COMMIT="$GIT_COMMIT" cargo build --release --locked \
+    --mount=type=cache,target=/src/server/target \
+    cargo build --release --locked \
  && cp target/release/ytp-server /out-ytp-server
 
 FROM debian:bookworm-slim
@@ -44,6 +48,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=denoland/deno:bin-2.9.8 /deno /usr/local/bin/deno
 COPY --from=server /out-ytp-server /app/ytp-server
 COPY --from=web /src/web/dist /app/web
+# The version shown in Settings (read at runtime: see the server stage).
+ARG GIT_COMMIT
+ENV YTP_GIT_COMMIT=$GIT_COMMIT
+RUN date +%s > /app/built-at
 ENV YTP_BIND=0.0.0.0:8080 \
     YTP_DATA_DIR=/data \
     YTP_WEB_DIR=/app/web \

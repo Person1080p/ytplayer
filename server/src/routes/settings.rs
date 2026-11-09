@@ -54,21 +54,29 @@ pub struct Status {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Version {
-    commit: Option<&'static str>,
-    commit_short: Option<&'static str>,
+    commit: Option<String>,
+    commit_short: Option<String>,
     /// Built with uncommitted changes.
     dirty: bool,
     /// Unix time of the build.
     built_at: Option<i64>,
 }
 
+/// The commit and build time: from the image when it says (`YTP_GIT_COMMIT` in the environment, a
+/// `built-at` file next to the binary; the Docker image sets them in its last, cheap step, so the
+/// compile step stays cached when only the web app changed), else from the compile.
 fn version() -> Version {
-    let commit = option_env!("YTP_GIT_COMMIT").filter(|c| !c.is_empty());
+    let runtime = std::env::var("YTP_GIT_COMMIT").ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    let commit = runtime.clone().or_else(|| option_env!("YTP_GIT_COMMIT").filter(|c| !c.is_empty()).map(String::from));
+    let built_file = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::read_to_string(exe.with_file_name("built-at")).ok())
+        .and_then(|t| t.trim().parse().ok());
     Version {
+        commit_short: commit.as_ref().map(|c| c[..c.len().min(7)].to_string()),
         commit,
-        commit_short: commit.map(|c| &c[..c.len().min(7)]),
-        dirty: option_env!("YTP_GIT_DIRTY") == Some("1"),
-        built_at: option_env!("YTP_BUILT_AT").and_then(|t| t.parse().ok()),
+        dirty: runtime.is_none() && option_env!("YTP_GIT_DIRTY") == Some("1"),
+        built_at: built_file.or_else(|| option_env!("YTP_BUILT_AT").and_then(|t| t.parse().ok())),
     }
 }
 
