@@ -13,7 +13,7 @@
 // `volume` and only lets an element that has already played auto-advance in the
 // background, so there a single element is kept and only the download is done ahead.
 
-import { api, bumpSourceRev, fetchAudio, hlsUrl, randomId, streamUrl, type AudioSource, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
+import { api, bumpSourceRev, fetchAudio, hlsUrl, randomId, streamUrl, type AudioSource, type InsertAt, type SourceInfo, type Queue, type QueueItem, type Track } from "./api";
 import { invalidateLocal, localUrl, needsDecision, prepareLocal, skipLocal } from "./localFolder";
 import { useStore } from "./store";
 import { apiFetch, detectConnection, isTailnet } from "./transport";
@@ -202,6 +202,25 @@ const knownSource = new Map<string, AudioSource>();
  * before starting. It needs to know the source first: other sources play their file directly.
  */
 const hlsWanted = () => nativeHls && !opusOk && !isTailnet();
+
+/** How this device plays server songs, and why (Settings → This device). */
+export function playbackMode(): string {
+  if (isTailnet()) return "through Tailscale: each song downloads completely, then plays";
+  if (hlsWanted()) return `YouTube songs as HLS (Safari)${dual ? ", preloading the next song" : ""}`;
+  const why = [!nativeHls && "no built-in HLS", opusOk && "plays Opus"].filter(Boolean).join(", ");
+  return `plain streams${why ? ` (${why})` : ""}${dual ? ", preloading the next song" : ""}`;
+}
+
+/** Ask the server where a song plays from (remembered for `playUrl`). Null: it couldn't say. */
+function sourceFirst(id: string): Promise<SourceInfo | null> {
+  return api.source(id).then(
+    (s) => {
+      knownSource.set(id, s.source);
+      return s;
+    },
+    () => null,
+  );
+}
 
 /** The server URL to play a track from: the plain stream, or in Safari a YouTube song's HLS playlist. */
 function playUrl(track: Track): string {
@@ -496,15 +515,8 @@ function loadSrc(track: Track, autoplay: boolean, fadeSeconds: number, token: nu
 /** Safari: ask where the song plays from, then load the matching URL (see `playUrl`). */
 function loadAfterSource(track: Track, autoplay: boolean, token: number) {
   const id = track.videoId;
-  api
-    .source(id)
-    .then(
-      (s) => s,
-      () => null,
-    )
-    .then((s) => {
+  void sourceFirst(id).then((s) => {
       if (token !== loadToken) return;
-      if (s) knownSource.set(id, s.source);
       const url = playUrl(track);
       audio.src = url;
       assign(audio, id, url);
@@ -522,7 +534,11 @@ function setSrcDual(track: Track, autoplay: boolean, fadeSeconds: number, token:
   // A crossfade still running (e.g. skipping again mid-fade): finish it so its element is free.
   if (!fadeSeconds) endFade();
   const el = spareEl();
-  const pre = spare && spare.el === el && spare.videoId === track.videoId && spare.ready && !el.error ? spare : null;
+  // In Safari a spare loaded before its source was known may hold the plain stream of a YouTube song.
+  const pre =
+    spare && spare.el === el && spare.videoId === track.videoId && spare.ready && !el.error && (localUrl(track.videoId) || spare.key === playUrl(track))
+      ? spare
+      : null;
   spare = null;
   if (pre) {
     if (pre.source !== undefined) set({ source: pre.source });
@@ -531,6 +547,21 @@ function setSrcDual(track: Track, autoplay: boolean, fadeSeconds: number, token:
     return;
   }
   const local = localUrl(track.videoId);
+  if (!local && hlsWanted()) {
+    if (!fadeSeconds) audio.pause();
+    void sourceFirst(track.videoId).then((s) => {
+      if (token !== loadToken) return;
+      const url = playUrl(track);
+      el.src = url;
+      assign(el, track.videoId, url);
+      if (s) {
+        setKbps(el, track.videoId, s.kbps ?? typicalKbps(s.source));
+        set({ source: s.source });
+      }
+      activate(el, track.videoId, autoplay, fadeSeconds);
+    });
+    return;
+  }
   if (local || !isTailnet()) {
     const url = local ?? playUrl(track);
     el.src = url;
@@ -633,6 +664,11 @@ function maybePreload() {
     if (spare.key === key || !spare.ready || full) return;
   }
   if (!currentLoaded()) return;
+  if (!local && hlsWanted() && !knownSource.has(videoId)) {
+    // Safari: the URL depends on the source (see playUrl); preload once it's known.
+    void sourceFirst(videoId).then((s) => s && maybePreload());
+    return;
+  }
   const entry: NonNullable<typeof spare> = { el, videoId, key, ready: false };
   spare = entry;
   if (local) {

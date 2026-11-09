@@ -37,7 +37,7 @@ import {
 import TailnetSetup from "../components/TailnetSetup";
 import ProfileToggle from "../components/ProfileToggle";
 import { resetFresh, useProfile } from "../lib/profile";
-import { CROSSFADE_MAX, crossfadeSupported, getCrossfade, setCrossfade } from "../lib/player";
+import { CROSSFADE_MAX, crossfadeSupported, getCrossfade, playbackMode, setCrossfade } from "../lib/player";
 import { getQualityPref, setQualityPref, type QualityPref } from "../lib/quality";
 
 function Section({
@@ -1229,6 +1229,7 @@ function DeviceSection({ status }: { status: Status | null }) {
           <>Checking…</>
         )}
       </p>
+      {conn && <p className="small muted">Plays {playbackMode()}.</p>}
 
       <div className="subsection">
         <div className="row between">
