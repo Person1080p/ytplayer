@@ -1,4 +1,5 @@
 # YTP Music in Docker: docker compose up -d --build, then open http://<host>:8080
+# Set FIREFOX_PASSWORD (and YTP_ACCESS_TOKEN) in the environment or a .env file first.
 services:
   ytp:
     build:
@@ -16,9 +17,36 @@ services:
       # Anyone who can reach the port can use the app and its signed-in accounts unless this is set;
       # the app then asks for it once per browser.
       YTP_ACCESS_TOKEN: ${YTP_ACCESS_TOKEN:-}
+      # Settings → YouTube Music sends you to the firefox service below to sign in.
+      YTP_SIGNIN_BROWSER_URL: ${YTP_SIGNIN_BROWSER_URL:-https://localhost:5800}
     volumes:
       # SQLite database (sign-ins and tokens), Tailscale identity, cover art, audio cache and yt-dlp.
       - data:/data
+      # The firefox service's profile, where yt-dlp finds the YouTube sign-in (read-only).
+      - firefox:/home/ytp/.mozilla/firefox:ro
+
+  # The server's own browser for "Sign in with Google": Firefox in a web page (port 5800). Sign in to
+  # YouTube Music there and leave it running, so the server can keep re-reading the fresh sign-in.
+  firefox:
+    image: jlesage/firefox:v26.09.1
+    restart: unless-stopped
+    shm_size: 1g # Firefox crashes with Docker's default 64 MB
+    ports:
+      - "5800:5800"
+    environment:
+      TZ: ${TZ:-UTC}
+      USER_ID: "1000" # same user as the ytp service, so it can read the profile
+      GROUP_ID: "1000"
+      KEEP_APP_RUNNING: "1" # quitting Firefox (which saves new sign-ins to disk) restarts it
+      FF_OPEN_URL: https://music.youtube.com
+      # This browser is signed in to your Google account: HTTPS (self-signed) and a login page.
+      SECURE_CONNECTION: "1"
+      WEB_AUTHENTICATION: "1"
+      WEB_AUTHENTICATION_USERNAME: ytp
+      WEB_AUTHENTICATION_PASSWORD: ${FIREFOX_PASSWORD:?set FIREFOX_PASSWORD, the password for the Firefox page}
+    volumes:
+      - firefox:/config
 
 volumes:
   data:
+  firefox:

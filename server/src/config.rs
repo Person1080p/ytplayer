@@ -25,6 +25,9 @@ pub struct Config {
     /// Where the managed yt-dlp is kept. Defaults to `<data>/bin`; point it at a local disk when
     /// the data dir is on a network share, since yt-dlp is read in full on every start.
     pub bin_dir: PathBuf,
+    /// A browser for the server that's used through a web page (e.g. a Firefox container's web UI).
+    /// Settings → YouTube Music then sends the user there to sign in, instead of to Google.
+    pub signin_browser_url: Option<String>,
     pub tailscale: TailscaleConfig,
 }
 
@@ -46,6 +49,7 @@ impl Config {
             lastfm_api_secret: env("LASTFM_API_SECRET"),
             ytdlp_path: env("YTDLP_PATH").map(PathBuf::from),
             bin_dir: env("YTP_BIN_DIR").map(PathBuf::from).unwrap_or_else(|| data_dir.join("bin")),
+            signin_browser_url: env("YTP_SIGNIN_BROWSER_URL"),
             tailscale: TailscaleConfig {
                 // Builds with the embedded node use it unless told otherwise (TS_EMBEDDED=0).
                 embedded: env("TS_EMBEDDED")

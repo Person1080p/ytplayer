@@ -46,7 +46,7 @@ pub async fn find_session(state: &AppState, only: Option<&str>) -> anyhow::Resul
     }
     if !not_signed_in.is_empty() {
         bail!(
-            "Found {} on the server computer, but it isn't signed in to YouTube. Sign in at music.youtube.com in that browser, then try again.",
+            "Found {} on the server computer, but it isn't signed in to YouTube. Sign in at music.youtube.com in that browser, then try again. If you just signed in, quit that browser once: Firefox only saves new sign-ins to disk from time to time and when it quits.",
             not_signed_in.join(", ")
         );
     }

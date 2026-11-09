@@ -107,6 +107,7 @@ pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiRes
             "syncError": st.db.get_setting(ytauth::SYNC_ERROR_KEY).await?,
             // YouTube answers the saved sign-in as signed out (it expired) since this time.
             "expiredSince": st.yt.session_expired_since().await,
+            "signinBrowserUrl": st.cfg.signin_browser_url,
         }),
         plex: json!({
             "connected": plex.is_some(),

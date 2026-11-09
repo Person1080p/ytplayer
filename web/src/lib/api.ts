@@ -209,6 +209,8 @@ export type Status = {
     syncError?: string | null;
     /** Since when (unix seconds) YouTube treats the saved sign-in as signed out: it expired. */
     expiredSince?: number | null;
+    /** The server's own browser, used through a web page; sign in there instead of in this browser. */
+    signinBrowserUrl?: string | null;
   };
   /** `enabled`: connected and on in Audio sources. */
   plex: { connected: boolean; url?: string | null; loggedIn: boolean; enabled?: boolean };

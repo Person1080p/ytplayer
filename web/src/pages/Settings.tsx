@@ -95,6 +95,8 @@ function YouTubeMusic({ status, reload }: { status: Status; reload: () => void }
   const [error, setError] = useState<string | null>(null);
   const autoTried = useRef(false);
   const onServerComputer = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  // A server without a desktop (e.g. in Docker) can offer its own browser through a web page.
+  const serverBrowser = yt.signinBrowserUrl || null;
 
   const importFromBrowser = async (quiet = false) => {
     setBusy("import");
@@ -206,7 +208,7 @@ function YouTubeMusic({ status, reload }: { status: Status; reload: () => void }
       ) : (
         <>
           <div className="setup-step">
-            {!onServerComputer && (
+            {!onServerComputer && !serverBrowser && (
               <p className="small warn-text">
                 Do this on the computer that runs the server: the server picks up the sign-in from that computer's browser.
               </p>
@@ -214,7 +216,7 @@ function YouTubeMusic({ status, reload }: { status: Status; reload: () => void }
             <div className="row gap wrap">
               <a
                 className="btn"
-                href={GOOGLE_SIGN_IN}
+                href={serverBrowser ?? GOOGLE_SIGN_IN}
                 target="_blank"
                 rel="noreferrer"
                 onClick={() => {
@@ -222,16 +224,20 @@ function YouTubeMusic({ status, reload }: { status: Status; reload: () => void }
                   setOpened(true);
                 }}
               >
-                Sign in with Google
+                {serverBrowser ? "Open the server's browser" : "Sign in with Google"}
               </a>
               <button className="btn ghost" disabled={busy === "import"} onClick={() => importFromBrowser()}>
                 {busy === "import" ? "Looking for your sign-in…" : opened ? "I've signed in — finish" : "Already signed in? Import"}
               </button>
             </div>
             <p className="muted small">
-              {opened
-                ? "Sign in on the Google page that opened, then come back here — this finishes automatically."
-                : "Opens Google's sign-in page in a new tab. Afterwards the server reads your YouTube sign-in from this computer's browser (Firefox, Chrome, Chromium, Brave, Edge, Vivaldi or Opera)."}
+              {serverBrowser
+                ? opened
+                  ? "In the server's browser, sign in at music.youtube.com, then quit it from its menu (it reopens by itself; quitting saves the sign-in). Come back here — this finishes automatically."
+                  : "Opens the server's own browser in a new tab (it asks for its own password first). Sign in to YouTube Music there; the server reads the sign-in from it and keeps it fresh."
+                : opened
+                  ? "Sign in on the Google page that opened, then come back here — this finishes automatically."
+                  : "Opens Google's sign-in page in a new tab. Afterwards the server reads your YouTube sign-in from this computer's browser (Firefox, Chrome, Chromium, Brave, Edge, Vivaldi or Opera)."}
             </p>
             <label className="switch">
               <input type="checkbox" checked={keepInSync} onChange={(e) => setKeepInSync(e.target.checked)} />
