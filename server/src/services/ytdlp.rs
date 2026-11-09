@@ -26,6 +26,10 @@ const FORMAT: &str = "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best";
 /// AAC-LC for browsers without Opus, at every level (see [`AudioLevel::format`]).
 const FORMAT_NO_HEAAC: &str = "140/bestaudio[ext=m4a][format_id!=139]/bestaudio[ext=m4a]/bestaudio/best";
 const URL_TTL: Duration = Duration::from_secs(60 * 60 * 4);
+/// YouTube clients yt-dlp asks first (`YTP_YOUTUBE_CLIENTS` overrides; empty: yt-dlp's choice).
+/// With a JS runtime (the Docker image has Deno) yt-dlp's own choice is the TV client, whose
+/// audio URLs googlevideo mostly answers with 403 now; the visionOS client's play.
+const DEFAULT_CLIENTS: &str = "visionos";
 
 #[cfg(feature = "embed-ytdlp")]
 static EMBEDDED: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/yt-dlp"));
@@ -103,6 +107,8 @@ pub struct YtDlp {
     /// `--version` output. Starting yt-dlp takes seconds (it unpacks itself), so ask once.
     version: Mutex<Option<String>>,
     cache: Mutex<HashMap<String, (ResolvedStream, Instant)>>,
+    /// `player_client` for yt-dlp, tried before its defaults. None: only its defaults.
+    clients: Option<String>,
 }
 
 impl YtDlp {
@@ -115,6 +121,10 @@ impl YtDlp {
             bin: Mutex::new(None),
             version: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
+            clients: match std::env::var("YTP_YOUTUBE_CLIENTS") {
+                Ok(v) => Some(v.trim().to_string()).filter(|v| !v.is_empty()),
+                Err(_) => Some(DEFAULT_CLIENTS.to_string()),
+            },
         }
     }
 
@@ -225,13 +235,22 @@ impl YtDlp {
         let bin = self.binary().await?;
         let detail = if level == AudioLevel::High { video_id.to_string() } else { format!("{video_id} ({level:?})") };
         let timer = crate::services::ytlog::start("ytdlp", "resolve", detail);
-        let out = match Command::new(bin)
-            .args(["-f", format, "-j", "--no-playlist", "--no-warnings", "--no-progress"])
-            .arg(watch_url(video_id))
-            .stdin(Stdio::null())
-            .output()
-            .await
-        {
+        let run = |clients: Option<&str>| {
+            let mut cmd = Command::new(&bin);
+            cmd.args(["-f", format, "-j", "--no-playlist", "--no-warnings", "--no-progress"]);
+            if let Some(c) = clients {
+                cmd.arg("--extractor-args").arg(format!("youtube:player_client={c}"));
+            }
+            cmd.arg(watch_url(video_id)).stdin(Stdio::null()).output()
+        };
+        let mut out = run(self.clients.as_deref()).await;
+        // The preferred clients can't get this video (or yt-dlp no longer knows them): yt-dlp's own.
+        if self.clients.is_some() && out.as_ref().is_ok_and(|o| !o.status.success()) {
+            let err = out.as_ref().map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string()).unwrap_or_default();
+            tracing::info!("yt-dlp with player_client {} failed for {video_id}, trying its defaults: {}", self.clients.as_deref().unwrap_or(""), err.chars().take(200).collect::<String>());
+            out = run(None).await;
+        }
+        let out = match out {
             Ok(o) => o,
             Err(e) => {
                 timer.done("error", None, 1, Some(e.to_string()));
@@ -281,8 +300,12 @@ impl YtDlp {
     pub async fn pipe(&self, video_id: &str, level: AudioLevel, opus: bool) -> anyhow::Result<tokio::process::Child> {
         let bin = self.binary().await?;
         crate::services::ytlog::start("ytdlp", "pipe", video_id).done("ok", None, 1, None);
-        let child = Command::new(bin)
-            .args(["-f", level.format(opus), "-o", "-", "--quiet", "--no-playlist", "--no-part"])
+        let mut cmd = Command::new(bin);
+        cmd.args(["-f", level.format(opus), "-o", "-", "--quiet", "--no-playlist", "--no-part"]);
+        if let Some(c) = &self.clients {
+            cmd.arg("--extractor-args").arg(format!("youtube:player_client={c}"));
+        }
+        let child = cmd
             .arg(watch_url(video_id))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
