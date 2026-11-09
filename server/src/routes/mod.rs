@@ -58,6 +58,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/missing", get(music::missing))
         .route("/stream/{video_id}", get(stream::stream))
         .route("/stream/{video_id}/hls.m3u8", get(stream::hls))
+        .route("/stream/{video_id}/seg", get(stream::live_segment))
         .route("/history", get(music::history))
         .route("/playback", post(settings::playback_event))
         // queue

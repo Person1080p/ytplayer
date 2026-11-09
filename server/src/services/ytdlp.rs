@@ -49,6 +49,8 @@ pub struct ResolvedStream {
     pub thumbnail: Option<String>,
     /// Audio bitrate in kbps, when yt-dlp reports it.
     pub kbps: Option<u32>,
+    /// A livestream: `url` is an HLS playlist (YouTube offers live audio only that way), not a file.
+    pub live: bool,
 }
 
 /// How much audio data to send. The browser picks it from how fast its connection to this
@@ -291,6 +293,7 @@ impl YtDlp {
             duration: v["duration"].as_f64().map(|d| d.round() as u32),
             thumbnail: s("thumbnail"),
             kbps: v["abr"].as_f64().or_else(|| v["tbr"].as_f64()).map(|k| k.round() as u32),
+            live: v["is_live"].as_bool() == Some(true) || v["protocol"].as_str().is_some_and(|p| p.starts_with("m3u8")),
         };
         self.cache.lock().await.insert(key, (resolved.clone(), Instant::now()));
         Ok(resolved)

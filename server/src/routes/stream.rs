@@ -390,6 +390,8 @@ async fn youtube_stream(
     mode: YoutubeMode,
 ) -> Tried<Response> {
     let pipe_only = mode == YoutubeMode::Pipe;
+    // A livestream has no file to proxy (only an HLS playlist): the pipe sends its audio, as AAC.
+    let mut live = false;
     let video_id = match youtube_video(st, song_id).await {
         Ok(Some(v)) => v,
         Ok(None) => return Tried::NotThere,
@@ -422,6 +424,14 @@ async fn youtube_stream(
                     break;
                 }
             };
+            if resolved.live {
+                live = true;
+                if mode == YoutubeMode::Any {
+                    let extra = request_headers(&resolved);
+                    return Tried::Played(with_source(live_follow(st.http.clone(), resolved.url.clone(), extra), "youtube"));
+                }
+                break;
+            }
             let extra: Vec<(String, String)> = resolved
                 .headers
                 .iter()
@@ -455,8 +465,10 @@ async fn youtube_stream(
         }
     }
 
-    if mode == YoutubeMode::File {
-        return Tried::Failed(AppError::NotConfigured("YouTube's audio file isn't reachable right now".into()));
+    if mode == YoutubeMode::File || (live && mode == YoutubeMode::Remux) {
+        // Remux: a livestream never ends, so the tailnet player (which downloads songs whole) can't play it.
+        let msg = if live { "Livestreams can't play through Tailscale on this device" } else { "YouTube's audio file isn't reachable right now" };
+        return Tried::Failed(AppError::NotConfigured(msg.into()));
     }
     // Last resort: pipe yt-dlp's output. No seeking, but works when direct URLs are blocked.
     let mut child = match st.ytdlp.pipe(video_id, quality.level(), quality.opus()).await {
@@ -476,7 +488,9 @@ async fn youtube_stream(
         chunk
     }));
     let mut resp = Response::new(body);
-    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mp4"));
+    // A livestream's audio arrives as ADTS AAC (YouTube's live HLS segments, back to back).
+    let ct = if live { "audio/aac" } else { "audio/mp4" };
+    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(ct));
     resp.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
     Tried::Played(with_source(resp, "youtube"))
 }
@@ -508,7 +522,10 @@ pub async fn hls(
 
     match hls_playlist(&st, &video_id, q.quality(), query).await {
         Ok(text) => {
-            tracing::info!("hls {video_id}: playlist of {} segments", text.matches("#EXTINF").count());
+            // A live playlist is fetched again every few seconds: log songs only.
+            if text.contains("#EXT-X-ENDLIST") {
+                tracing::info!("hls {video_id}: playlist of {} segments", text.matches("#EXTINF").count());
+            }
             Ok(Response::builder()
             .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
             .header(header::CACHE_CONTROL, "no-store")
@@ -549,6 +566,17 @@ async fn hls_playlist(st: &SharedState, video_id: &str, quality: QualityQuery, q
     let mut why = String::new();
     for attempt in 0..2 {
         let resolved = st.ytdlp.resolve(&youtube, quality.level(), quality.opus()).await.map_err(|e| format!("yt-dlp: {e:#}"))?;
+        if resolved.live {
+            match live_playlist(st, video_id, &resolved, query).await {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    tracing::warn!("live playlist for {youtube} (attempt {attempt}): {e:#}");
+                    why = format!("live playlist: {e:#}");
+                    st.ytdlp.invalidate(&youtube).await;
+                    continue;
+                }
+            }
+        }
         if resolved.mime != "audio/mp4" {
             return Err(format!("not MP4 ({})", resolved.mime));
         }
@@ -743,6 +771,228 @@ async fn remux_youtube(
     let mut resp = result?;
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mp4"));
     Ok(resp)
+}
+
+/// A livestream's HLS playlist from YouTube, with each segment (and any header) pointed at
+/// [`live_segment`] on this server: YouTube's segment URLs only work from this server's address.
+/// Fetched fresh on every request (the player re-reads a live playlist every few seconds).
+async fn live_playlist(st: &SharedState, video_id: &str, resolved: &crate::services::ytdlp::ResolvedStream, query: &str) -> anyhow::Result<String> {
+    let mut req = st.http.get(&resolved.url);
+    for (k, v) in &resolved.headers {
+        if matches!(k.to_ascii_lowercase().as_str(), "user-agent" | "accept-language" | "referer" | "origin") {
+            req = req.header(k.as_str(), v.as_str());
+        }
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("upstream returned {}", resp.status());
+    }
+    let base = reqwest::Url::parse(&resolved.url)?;
+    let text = resp.text().await?;
+    if !text.starts_with("#EXTM3U") {
+        anyhow::bail!("not an HLS playlist");
+    }
+    let rest: String = query.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("via=")).map(|kv| format!("&{kv}")).collect();
+    Ok(rewrite_live_playlist(&text, &base, video_id, &rest))
+}
+
+/// `text` with every URI (segment lines and `URI="…"` attributes) made absolute against `base` and
+/// sent through `../{video_id}/seg?u=…{rest}`.
+fn rewrite_live_playlist(text: &str, base: &reqwest::Url, video_id: &str, rest: &str) -> String {
+    let proxied = |uri: &str| -> String {
+        let abs = base.join(uri.trim()).map(|u| u.to_string()).unwrap_or_else(|_| uri.trim().to_string());
+        format!("../{video_id}/seg?u={}{rest}", urlencoding::encode(&abs))
+    };
+    let mut out = String::with_capacity(text.len() * 2);
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if !line.starts_with('#') {
+            out.push_str(&proxied(line));
+        } else if let Some(i) = line.find("URI=\"") {
+            let start = i + 5;
+            match line[start..].find('"') {
+                Some(len) => {
+                    out.push_str(&line[..start]);
+                    out.push_str(&proxied(&line[start..start + len]));
+                    out.push_str(&line[start + len..]);
+                }
+                None => out.push_str(line),
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[derive(Deserialize)]
+pub struct SegmentQuery {
+    u: String,
+    #[serde(default)]
+    kbps: Option<u32>,
+    #[serde(default)]
+    opus: Option<u8>,
+}
+
+/// `GET /stream/{id}/seg?u=…`: one segment of a livestream's playlist (see [`live_playlist`]),
+/// fetched from YouTube. Only YouTube's video servers, over HTTPS: this isn't a general proxy.
+pub async fn live_segment(
+    State(st): State<SharedState>,
+    Path(video_id): Path<String>,
+    Query(q): Query<SegmentQuery>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let url = reqwest::Url::parse(&q.u).map_err(|_| AppError::bad("invalid segment url"))?;
+    let host_ok = url.host_str().is_some_and(|h| h == "googlevideo.com" || h.ends_with(".googlevideo.com"));
+    if url.scheme() != "https" || !host_ok {
+        return Err(AppError::bad("not a YouTube segment"));
+    }
+    let quality = QualityQuery { kbps: q.kbps, opus: q.opus };
+    // The same request headers yt-dlp would use (its resolve is cached, so this rarely runs it).
+    let extra: Vec<(String, String)> = match youtube_video(&st, &video_id).await {
+        Ok(Some(yt)) => match st.ytdlp.resolve(&yt, quality.level(), quality.opus()).await {
+            Ok(r) => r
+                .headers
+                .iter()
+                .filter(|(k, _)| matches!(k.to_ascii_lowercase().as_str(), "user-agent" | "accept-language" | "referer" | "origin"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    // Live audio segments are ADTS AAC (with ID3 timestamps); YouTube labels them octet-stream.
+    let mime = (url.path().contains("/itag/233/") || url.path().contains("/itag/234/")).then_some("audio/aac");
+    let mut resp = proxy(&st.http, url.as_str(), headers.get(header::RANGE).cloned(), &extra, mime, None).await?;
+    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(resp)
+}
+
+/// The request headers yt-dlp says to send to YouTube's servers.
+fn request_headers(resolved: &crate::services::ytdlp::ResolvedStream) -> Vec<(String, String)> {
+    resolved
+        .headers
+        .iter()
+        .filter(|(k, _)| matches!(k.to_ascii_lowercase().as_str(), "user-agent" | "accept-language" | "referer" | "origin"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// A livestream for players without HLS (everything but Safari): this server follows YouTube's
+/// live playlist, starting near the live edge, and sends each new segment as it appears, as one
+/// endless ADTS AAC stream (each segment's ID3 timestamp tag dropped). yt-dlp can't: it hands live
+/// streams to ffmpeg, which rejects these segments.
+fn live_follow(http: reqwest::Client, playlist: String, extra: Vec<(String, String)>) -> Response {
+    struct Follow {
+        http: reqwest::Client,
+        playlist: String,
+        extra: Vec<(String, String)>,
+        /// Media sequence number of the last segment queued.
+        last: Option<u64>,
+        queue: std::collections::VecDeque<String>,
+        failures: u32,
+    }
+    let get = |f: &Follow, url: &str| {
+        let mut req = f.http.get(url);
+        for (k, v) in &f.extra {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req.send()
+    };
+    let start = Follow { http, playlist, extra, last: None, queue: Default::default(), failures: 0 };
+    let stream = futures::stream::unfold(start, move |mut f| async move {
+        loop {
+            if f.failures >= 4 {
+                return None; // the stream ended, or YouTube stopped answering
+            }
+            if let Some(seg) = f.queue.pop_front() {
+                match get(&f, &seg).await.and_then(|r| r.error_for_status()) {
+                    Ok(r) => match r.bytes().await {
+                        Ok(b) => {
+                            f.failures = 0;
+                            return Some((Ok::<_, std::io::Error>(strip_id3(b)), f));
+                        }
+                        Err(_) => f.failures += 1,
+                    },
+                    Err(_) => f.failures += 1,
+                }
+                continue;
+            }
+            let text = match get(&f, &f.playlist.clone()).await.and_then(|r| r.error_for_status()) {
+                Ok(r) => r.text().await.unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            let Some(pl) = LivePlaylist::parse(&text, &f.playlist) else {
+                f.failures += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            };
+            let first_new = match f.last {
+                Some(last) => last + 1,
+                // Start three segments back from the live edge: a few seconds to buffer.
+                None => (pl.sequence + pl.segments.len() as u64).saturating_sub(3).max(pl.sequence),
+            };
+            for (i, uri) in pl.segments.iter().enumerate() {
+                let seq = pl.sequence + i as u64;
+                if seq >= first_new {
+                    f.queue.push_back(uri.clone());
+                    f.last = Some(seq);
+                }
+            }
+            if f.queue.is_empty() {
+                // Nothing new yet: look again in about half a segment.
+                tokio::time::sleep(std::time::Duration::from_millis((pl.target_secs * 500).clamp(1000, 5000))).await;
+            }
+        }
+    });
+    let mut resp = Response::new(Body::from_stream(stream));
+    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/aac"));
+    resp.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
+    resp
+}
+
+/// What [`live_follow`] needs from a live media playlist.
+#[derive(Debug, PartialEq)]
+struct LivePlaylist {
+    sequence: u64,
+    target_secs: u64,
+    /// Absolute segment URLs, oldest first.
+    segments: Vec<String>,
+}
+
+impl LivePlaylist {
+    fn parse(text: &str, base: &str) -> Option<Self> {
+        if !text.starts_with("#EXTM3U") {
+            return None;
+        }
+        let base = reqwest::Url::parse(base).ok()?;
+        let (mut sequence, mut target_secs, mut segments) = (0, 5, Vec::new());
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if let Some(v) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                sequence = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+                target_secs = v.trim().parse().unwrap_or(5);
+            } else if !line.starts_with('#') {
+                segments.push(base.join(line).ok()?.to_string());
+            }
+        }
+        Some(LivePlaylist { sequence, target_secs, segments })
+    }
+}
+
+/// A segment without its leading ID3v2 tag (YouTube puts a timestamp tag before the audio).
+fn strip_id3(b: bytes::Bytes) -> bytes::Bytes {
+    if b.len() < 10 || &b[..3] != b"ID3" {
+        return b;
+    }
+    let size = b[6..10].iter().fold(0usize, |acc, &x| (acc << 7) | (x & 0x7f) as usize);
+    let footer = if b[5] & 0x10 != 0 { 10 } else { 0 };
+    let end = (10 + size + footer).min(b.len());
+    b.slice(end..)
 }
 
 /// `x-audio-kbps`: lets the in-page tailnet player (which reads headers) know the bitrate.
@@ -971,6 +1221,40 @@ async fn proxy_youtube(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_playlist_rewritten() {
+        let base = reqwest::Url::parse("https://manifest.googlevideo.com/api/manifest/hls_playlist/x/index.m3u8").unwrap();
+        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:5.0,\nhttps://rr1---sn.googlevideo.com/videoplayback/itag/234/sq/7\n\n#EXT-X-ENDLIST";
+        let out = rewrite_live_playlist(text, &base, "abc", "&opus=0");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "#EXTM3U");
+        assert_eq!(
+            lines[1],
+            "#EXT-X-MAP:URI=\"../abc/seg?u=https%3A%2F%2Fmanifest.googlevideo.com%2Fapi%2Fmanifest%2Fhls_playlist%2Fx%2Finit.mp4&opus=0\""
+        );
+        assert_eq!(lines[3], "../abc/seg?u=https%3A%2F%2Frr1---sn.googlevideo.com%2Fvideoplayback%2Fitag%2F234%2Fsq%2F7&opus=0");
+        assert_eq!(lines[5], "#EXT-X-ENDLIST");
+    }
+
+    #[test]
+    fn live_playlist_parsed() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:5.0,\nseg/100\n#EXTINF:5.0,\nhttps://rr1.googlevideo.com/seg/101\n";
+        let pl = LivePlaylist::parse(text, "https://manifest.googlevideo.com/live/index.m3u8").unwrap();
+        assert_eq!(pl.sequence, 100);
+        assert_eq!(pl.target_secs, 5);
+        assert_eq!(pl.segments, vec!["https://manifest.googlevideo.com/live/seg/100", "https://rr1.googlevideo.com/seg/101"]);
+        assert_eq!(LivePlaylist::parse("<html>", "https://x/"), None);
+    }
+
+    #[test]
+    fn id3_stripped() {
+        // "ID3", v3.0, no flags, size 4 (syncsafe), 4 bytes of tag, then audio.
+        let b = bytes::Bytes::from_static(b"ID3\x03\x00\x00\x00\x00\x00\x04TAGS\xff\xf1audio");
+        assert_eq!(&strip_id3(b)[..], b"\xff\xf1audio");
+        let plain = bytes::Bytes::from_static(b"\xff\xf1audio");
+        assert_eq!(&strip_id3(plain)[..], b"\xff\xf1audio");
+    }
 
     #[test]
     fn simple_ranges() {
