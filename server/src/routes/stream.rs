@@ -241,7 +241,7 @@ async fn youtube_source(st: &SharedState, video_id: &str, q: QualityQuery) -> Tr
     }
     // Same (cached) resolve the stream itself uses, so this rarely runs yt-dlp.
     let kbps = match st.ytdlp.resolve(&youtube, q.level(), q.opus()).await {
-        Ok(r) => r.kbps.or(Some(q.level().nominal_kbps())),
+        Ok(r) => r.kbps.or(Some(q.level().nominal_kbps(q.opus()))),
         Err(e) => {
             if missing::video_gone(&format!("{e:#}")) {
                 missing::mark(st, video_id, &format!("{e:#}")).await;

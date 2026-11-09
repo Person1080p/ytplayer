@@ -18,7 +18,7 @@ import { invalidateLocal, localUrl, needsDecision, prepareLocal, skipLocal } fro
 import { useStore } from "./store";
 import { apiFetch, detectConnection, isTailnet } from "./transport";
 import { loadProfile } from "./profile";
-import { qualityBudget, reportSpeed, reportStall } from "./quality";
+import { opusOk, qualityBudget, reportSpeed, reportStall } from "./quality";
 
 function makeAudio() {
   const a = new Audio();
@@ -179,7 +179,8 @@ function typicalKbps(source: AudioSource): number | null {
   if (source === "cache") return 192;
   if (source !== "youtube") return null;
   const b = qualityBudget();
-  return b == null || b >= 128 ? 130 : b >= 64 ? 66 : 50;
+  // Without Opus, YouTube is always AAC 140 (the server avoids HE-AAC, which Safari mistimes).
+  return !opusOk || b == null || b >= 128 ? 130 : b >= 64 ? 66 : 50;
 }
 
 function publishBuffered() {

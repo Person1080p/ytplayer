@@ -23,6 +23,8 @@ use serde_json::Value;
 use tokio::{process::Command, sync::Mutex};
 
 const FORMAT: &str = "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best";
+/// AAC-LC for browsers without Opus, at every level (see [`AudioLevel::format`]).
+const FORMAT_NO_HEAAC: &str = "140/bestaudio[ext=m4a][format_id!=139]/bestaudio[ext=m4a]/bestaudio/best";
 const URL_TTL: Duration = Duration::from_secs(60 * 60 * 4);
 
 #[cfg(feature = "embed-ytdlp")]
@@ -51,9 +53,9 @@ pub struct ResolvedStream {
 pub enum AudioLevel {
     /// ~130 kbps (AAC 140 / Opus 251)
     High,
-    /// ~66 kbps (Opus 250), or ~49 kbps HE-AAC where Opus can't play
+    /// ~66 kbps (Opus 250); AAC 140 where Opus can't play
     Medium,
-    /// ~50 kbps (Opus 249 / HE-AAC 139)
+    /// ~50 kbps (Opus 249); AAC 140 where Opus can't play
     Low,
 }
 
@@ -69,20 +71,24 @@ impl AudioLevel {
     }
 
     /// yt-dlp format selector. `opus`: the browser can play WebM/Opus (Safari often can't).
+    ///
+    /// Never HE-AAC (139): Safari (iOS especially) misreads its length as twice the real one, so
+    /// the song shows double its time and the second half is silence. Without Opus there's no
+    /// smaller format that plays right, so every level is AAC-LC 140 there.
     fn format(self, opus: bool) -> &'static str {
         match (self, opus) {
             (Self::High, _) => FORMAT,
-            (Self::Medium, true) => "250/139/249/bestaudio[ext=m4a]/bestaudio/best",
-            (Self::Low, true) => "249/139/250/bestaudio[ext=m4a]/bestaudio/best",
-            (_, false) => "139/bestaudio[ext=m4a]/bestaudio/best",
+            (Self::Medium, true) => "250/249/bestaudio[acodec=opus]/bestaudio[ext=m4a][format_id!=139]/bestaudio/best",
+            (Self::Low, true) => "249/250/bestaudio[acodec=opus]/bestaudio[ext=m4a][format_id!=139]/bestaudio/best",
+            (_, false) => FORMAT_NO_HEAAC,
         }
     }
 
-    pub fn nominal_kbps(self) -> u32 {
-        match self {
-            Self::High => 130,
-            Self::Medium => 66,
-            Self::Low => 50,
+    pub fn nominal_kbps(self, opus: bool) -> u32 {
+        match (self, opus) {
+            (Self::High, _) | (_, false) => 130,
+            (Self::Medium, true) => 66,
+            (Self::Low, true) => 50,
         }
     }
 }
