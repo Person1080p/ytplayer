@@ -255,7 +255,8 @@ async fn youtube_source(st: &SharedState, video_id: &str, q: QualityQuery) -> Tr
 #[derive(Deserialize)]
 pub struct StreamQuery {
     /// Force a source: `youtube` goes straight to YouTube (when it's on), `pipe` streams
-    /// yt-dlp's stdout directly.
+    /// yt-dlp's stdout directly, `dash` is YouTube's own file only (never the cached MP3 or the
+    /// pipe: the byte ranges of an [`hls`] playlist point into that file).
     #[serde(default)]
     via: Option<String>,
     // Same as QualityQuery (`serde(flatten)` breaks number parsing in query strings).
@@ -293,7 +294,7 @@ pub async fn stream(
     let mut failure = None;
     for &s in &song.plan {
         let tried = match s {
-            Source::Youtube => youtube_stream(&st, &video_id, range.clone(), quality, q.via.as_deref() == Some("pipe")).await,
+            Source::Youtube => youtube_stream(&st, &video_id, range.clone(), quality, YoutubeMode::from_via(q.via.as_deref())).await,
             lib => match song.item(lib).await {
                 Tried::Played(item) => library_stream(&song, item, range.clone(), quality).await,
                 Tried::NotThere => Tried::NotThere,
@@ -344,6 +345,27 @@ async fn library_stream(song: &Song<'_>, item: LibraryItem, range: Option<Header
     }
 }
 
+/// Which of YouTube's ways to send a song `youtube_stream` may use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum YoutubeMode {
+    /// The cached MP3, else YouTube's file, else the pipe.
+    Any,
+    /// Only the pipe.
+    Pipe,
+    /// Only YouTube's file (an HLS playlist's byte ranges point into it).
+    File,
+}
+
+impl YoutubeMode {
+    fn from_via(via: Option<&str>) -> Self {
+        match via {
+            Some("pipe") => Self::Pipe,
+            Some("dash") => Self::File,
+            _ => Self::Any,
+        }
+    }
+}
+
 /// Stream a song from YouTube: the cached MP3 when there is one, else the audio yt-dlp finds
 /// (proxied, and copied into the cache), else yt-dlp's own output as a last resort.
 async fn youtube_stream(
@@ -351,8 +373,9 @@ async fn youtube_stream(
     song_id: &str,
     range: Option<HeaderValue>,
     quality: QualityQuery,
-    pipe_only: bool,
+    mode: YoutubeMode,
 ) -> Tried<Response> {
+    let pipe_only = mode == YoutubeMode::Pipe;
     let video_id = match youtube_video(st, song_id).await {
         Ok(Some(v)) => v,
         Ok(None) => return Tried::NotThere,
@@ -362,7 +385,8 @@ async fn youtube_stream(
 
     if !pipe_only {
         let from_start = range_start(range.as_ref()) == 0;
-        if let Some(path) = st.audio_cache.choose(video_id, from_start, quality.cache_ok()) {
+        let cached = if mode == YoutubeMode::File { None } else { st.audio_cache.choose(video_id, from_start, quality.cache_ok()) };
+        if let Some(path) = cached {
             match serve_file(path, range.clone()).await {
                 Some(resp) => return Tried::Played(with_kbps(with_source(resp, "cache"), Some(audiocache::KBPS))),
                 None => tracing::warn!("cached mp3 for {video_id} went missing, streaming from youtube"),
@@ -411,6 +435,9 @@ async fn youtube_stream(
         }
     }
 
+    if mode == YoutubeMode::File {
+        return Tried::Failed(AppError::NotConfigured("YouTube's audio file isn't reachable right now".into()));
+    }
     // Last resort: pipe yt-dlp's output. No seeking, but works when direct URLs are blocked.
     let mut child = match st.ytdlp.pipe(video_id, quality.level(), quality.opus()).await {
         Ok(c) => c,
@@ -432,6 +459,203 @@ async fn youtube_stream(
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mp4"));
     resp.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
     Tried::Played(with_source(resp, "youtube"))
+}
+
+// ---- HLS for Safari --------------------------------------------------------------------------
+//
+// YouTube's audio files are fragmented MP4: a header, then a fragment every ~10 s. Safari (iOS
+// especially) plays such a file only after visiting every fragment, one Range request each, which
+// for an hour-long mix is minutes of waiting. An HLS playlist lists the fragments up front (from
+// the file's own index, its `sidx` box), so Safari, which plays HLS natively, starts at once and
+// can seek. Its entries are byte ranges of `/stream?via=dash`: the same file, nothing re-encoded.
+
+/// `GET /stream/{id}/hls`: an HLS playlist for the song's YouTube file, or a redirect to the
+/// plain stream when it plays from somewhere else (a library, the cached MP3) or the file has no
+/// usable index.
+pub async fn hls(
+    State(st): State<SharedState>,
+    Path(video_id): Path<String>,
+    Query(q): Query<StreamQuery>,
+    uri: axum::http::Uri,
+) -> Result<Response, AppError> {
+    if !video_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || video_id.len() > 40 {
+        return Err(AppError::bad("invalid video id"));
+    }
+    // Relative to `/stream/{id}/hls`: `../{id}?…` is `/stream/{id}?…`, whatever prefix the app has.
+    let query = uri.query().unwrap_or("");
+    let plain = if query.is_empty() { format!("../{video_id}") } else { format!("../{video_id}?{query}") };
+    let redirect = || Response::builder().status(StatusCode::FOUND).header(header::LOCATION, plain.as_str()).header(header::CACHE_CONTROL, "no-store").body(Body::empty());
+
+    match hls_playlist(&st, &video_id, q.quality(), query).await {
+        Some(text) => Ok(Response::builder()
+            .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(text))
+            .map_err(|e| anyhow::anyhow!(e))?),
+        None => Ok(redirect().map_err(|e| anyhow::anyhow!(e))?),
+    }
+}
+
+/// The playlist, when the song plays from YouTube's (MP4) file right now. None: use the plain stream.
+async fn hls_playlist(st: &SharedState, video_id: &str, quality: QualityQuery, query: &str) -> Option<String> {
+    // Only when YouTube is what `/stream` would play: the first source that has the song.
+    let song = Song::new(st, video_id).await;
+    for &s in &song.plan {
+        match s {
+            Source::Youtube => break,
+            lib => match song.item(lib).await {
+                Tried::NotThere => continue,
+                _ => return None,
+            },
+        }
+    }
+    if !song.plan.contains(&Source::Youtube) {
+        return None;
+    }
+    let youtube = youtube_video(st, video_id).await.ok()??;
+    if st.audio_cache.peek(&youtube, quality.cache_ok()) {
+        return None;
+    }
+    for attempt in 0..2 {
+        let resolved = st.ytdlp.resolve(&youtube, quality.level(), quality.opus()).await.ok()?;
+        if resolved.mime != "audio/mp4" {
+            return None;
+        }
+        match fetch_index(st, &resolved).await {
+            Ok(Some(index)) => {
+                let mut seg = format!("../{video_id}?via=dash");
+                for kv in query.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("via=")) {
+                    seg.push('&');
+                    seg.push_str(kv);
+                }
+                return Some(index.playlist(&seg));
+            }
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!("hls index for {youtube} (attempt {attempt}): {e:#}");
+                st.ytdlp.invalidate(&youtube).await;
+            }
+        }
+    }
+    None
+}
+
+/// Read the start of YouTube's file and its fragment index. Ok(None): not an indexed MP4.
+async fn fetch_index(st: &SharedState, resolved: &crate::services::ytdlp::ResolvedStream) -> anyhow::Result<Option<Mp4Index>> {
+    let get = |from: u64, to: u64| {
+        let mut req = st.http.get(&resolved.url).header(header::RANGE, format!("bytes={from}-{to}"));
+        for (k, v) in &resolved.headers {
+            if matches!(k.to_ascii_lowercase().as_str(), "user-agent" | "accept-language" | "referer" | "origin") {
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+        async move {
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("upstream returned {}", resp.status());
+            }
+            anyhow::Ok(resp.bytes().await?.to_vec())
+        }
+    };
+    let mut head = get(0, 64 * 1024 - 1).await?;
+    // A long file's index can outgrow the first read: read up to its end.
+    if let Some(end) = index_end(&head) {
+        if end > head.len() as u64 && end < 4 * 1024 * 1024 {
+            let more = get(head.len() as u64, end - 1).await?;
+            head.extend_from_slice(&more);
+        }
+    }
+    Ok(Mp4Index::parse(&head))
+}
+
+/// An indexed MP4: the header (`ftyp` + `moov`) and its fragments as (offset, size, seconds).
+#[derive(Debug, PartialEq)]
+struct Mp4Index {
+    init_len: u64,
+    segments: Vec<(u64, u64, f64)>,
+}
+
+/// Top-level boxes in `buf`: (type, offset, size). Stops at a box that runs past `buf`, after
+/// listing it.
+fn top_boxes(buf: &[u8]) -> Vec<([u8; 4], u64, u64)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let size32 = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap()) as u64;
+        let kind: [u8; 4] = buf[off + 4..off + 8].try_into().unwrap();
+        let size = match size32 {
+            1 if off + 16 <= buf.len() => u64::from_be_bytes(buf[off + 8..off + 16].try_into().unwrap()),
+            0 | 1 => break,
+            n => n,
+        };
+        if size < 8 {
+            break;
+        }
+        out.push((kind, off as u64, size));
+        match usize::try_from(off as u64 + size) {
+            Ok(next) if next <= buf.len() => off = next,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Where the `sidx` box ends, if the header lists one.
+fn index_end(buf: &[u8]) -> Option<u64> {
+    top_boxes(buf).into_iter().find(|(k, _, _)| k == b"sidx").map(|(_, off, size)| off + size)
+}
+
+impl Mp4Index {
+    fn parse(buf: &[u8]) -> Option<Self> {
+        let boxes = top_boxes(buf);
+        let (_, moov_off, moov_size) = *boxes.iter().find(|(k, _, _)| k == b"moov")?;
+        let (_, sidx_off, sidx_size) = *boxes.iter().find(|(k, _, _)| k == b"sidx")?;
+        let end = usize::try_from(sidx_off + sidx_size).ok()?;
+        let b = buf.get(usize::try_from(sidx_off).ok()? + 8..end)?;
+        let u32_at = |i: usize| b.get(i..i + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()));
+        let u64_at = |i: usize| b.get(i..i + 8).map(|s| u64::from_be_bytes(s.try_into().unwrap()));
+        let version = *b.first()?;
+        let timescale = u32_at(8)? as f64;
+        let (first_offset, mut i) = if version == 0 { (u32_at(16)? as u64, 20) } else { (u64_at(20)?, 28) };
+        if timescale <= 0.0 {
+            return None;
+        }
+        i += 2; // reserved
+        let count = u16::from_be_bytes(b.get(i..i + 2)?.try_into().unwrap()) as usize;
+        i += 2;
+        let mut offset = sidx_off + sidx_size + first_offset;
+        let mut segments = Vec::with_capacity(count);
+        for _ in 0..count {
+            let r = u32_at(i)?;
+            if r & 0x8000_0000 != 0 {
+                return None; // points at another index, not media: not what YouTube writes
+            }
+            let size = (r & 0x7fff_ffff) as u64;
+            let secs = u32_at(i + 4)? as f64 / timescale;
+            segments.push((offset, size, secs));
+            offset += size;
+            i += 12;
+        }
+        if segments.is_empty() {
+            return None;
+        }
+        Some(Mp4Index { init_len: moov_off + moov_size, segments })
+    }
+
+    /// An HLS (v7, fMP4) playlist whose header and segments are byte ranges of `uri`.
+    fn playlist(&self, uri: &str) -> String {
+        use std::fmt::Write;
+        let target = self.segments.iter().map(|s| s.2).fold(0.0, f64::max).ceil().max(1.0) as u64;
+        let mut out = String::with_capacity(64 + self.segments.len() * (uri.len() + 48));
+        let _ = writeln!(out, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0");
+        let _ = writeln!(out, "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS");
+        let _ = writeln!(out, "#EXT-X-MAP:URI=\"{uri}\",BYTERANGE=\"{}@0\"", self.init_len);
+        for (offset, size, secs) in &self.segments {
+            let _ = writeln!(out, "#EXTINF:{secs:.3},\n#EXT-X-BYTERANGE:{size}@{offset}\n{uri}");
+        }
+        out.push_str("#EXT-X-ENDLIST\n");
+        out
+    }
 }
 
 /// `x-audio-kbps`: lets the in-page tailnet player (which reads headers) know the bitrate.
@@ -555,6 +779,53 @@ mod tests {
         assert_eq!(range_start(Some(&h("bytes=0-1"))), 0);
         assert_eq!(range_start(Some(&h("bytes=12345-"))), 12345);
         assert_eq!(range_start(Some(&h("bytes=-500"))), u64::MAX);
+    }
+
+    /// ftyp + moov + sidx (version 0, timescale 1000, two 10 s references) + the media.
+    fn indexed_mp4() -> Vec<u8> {
+        let mut b = Vec::new();
+        let boxed = |b: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]| {
+            b.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+            b.extend_from_slice(kind);
+            b.extend_from_slice(body);
+        };
+        boxed(&mut b, b"ftyp", b"dash\0\0\0\0iso6mp41");
+        boxed(&mut b, b"moov", &[0u8; 100]);
+        let mut sidx = vec![0u8, 0, 0, 0]; // version 0, flags
+        sidx.extend_from_slice(&1u32.to_be_bytes()); // reference_ID
+        sidx.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+        sidx.extend_from_slice(&0u32.to_be_bytes()); // earliest_presentation_time
+        sidx.extend_from_slice(&0u32.to_be_bytes()); // first_offset
+        sidx.extend_from_slice(&[0, 0, 0, 2]); // reserved, reference_count
+        for (size, dur) in [(5000u32, 10_000u32), (4000, 9_500)] {
+            sidx.extend_from_slice(&size.to_be_bytes());
+            sidx.extend_from_slice(&dur.to_be_bytes());
+            sidx.extend_from_slice(&0x9000_0000u32.to_be_bytes());
+        }
+        boxed(&mut b, b"sidx", &sidx);
+        b
+    }
+
+    #[test]
+    fn mp4_index_from_sidx() {
+        let b = indexed_mp4();
+        // ftyp 24 + moov 108 = header; sidx 8+12+8+4+24 = 56 → media from 188.
+        let idx = Mp4Index::parse(&b).unwrap();
+        assert_eq!(idx.init_len, 132);
+        assert_eq!(idx.segments, vec![(188, 5000, 10.0), (5188, 4000, 9.5)]);
+        assert_eq!(index_end(&b), Some(188));
+        let pl = idx.playlist("../abc?via=dash");
+        assert!(pl.starts_with("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:10\n"));
+        assert!(pl.contains("#EXT-X-MAP:URI=\"../abc?via=dash\",BYTERANGE=\"132@0\"\n"));
+        assert!(pl.contains("#EXTINF:9.500,\n#EXT-X-BYTERANGE:4000@5188\n../abc?via=dash\n"));
+        assert!(pl.ends_with("#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn mp4_index_needs_moov_and_whole_sidx() {
+        let b = indexed_mp4();
+        assert_eq!(Mp4Index::parse(&b[..b.len() - 4]), None, "sidx cut short");
+        assert_eq!(Mp4Index::parse(b"\x1aE\xdf\xa3 webm"), None);
     }
 
     #[test]

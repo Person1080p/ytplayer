@@ -13,7 +13,7 @@
 // `volume` and only lets an element that has already played auto-advance in the
 // background, so there a single element is kept and only the download is done ahead.
 
-import { api, bumpSourceRev, fetchAudio, randomId, streamUrl, type AudioSource, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
+import { api, bumpSourceRev, fetchAudio, hlsUrl, randomId, streamUrl, type AudioSource, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
 import { invalidateLocal, localUrl, needsDecision, prepareLocal, skipLocal } from "./localFolder";
 import { useStore } from "./store";
 import { apiFetch, detectConnection, isTailnet } from "./transport";
@@ -183,6 +183,25 @@ function typicalKbps(source: AudioSource): number | null {
   return !opusOk || b == null || b >= 128 ? 130 : b >= 64 ? 66 : 50;
 }
 
+/** Browsers that play HLS themselves (Safari). */
+const nativeHls = (() => {
+  try {
+    return new Audio().canPlayType("application/vnd.apple.mpegurl") !== "";
+  } catch {
+    return false;
+  }
+})();
+/** Songs at least this long (s) go to Safari as HLS (see `hlsUrl`); shorter ones load quickly anyway. */
+const HLS_FROM_SECONDS = 600;
+/** Songs whose HLS playlist failed this session: they use the plain stream. */
+const hlsFailed = new Set<string>();
+
+/** The server URL to play a track from: the plain stream, or for a long song in Safari its HLS playlist. */
+function playUrl(track: Track): string {
+  const hls = nativeHls && !opusOk && !isTailnet() && (track.duration ?? 0) >= HLS_FROM_SECONDS && !hlsFailed.has(track.videoId);
+  return hls ? hlsUrl(track.videoId) : streamUrl(track.videoId);
+}
+
 function publishBuffered() {
   const b = audio.buffered;
   const out: [number, number][] = [];
@@ -246,7 +265,7 @@ function reloadAtPosition(play = true) {
   const el = audio;
   const at = el.currentTime;
   const local = localUrl(it.track.videoId);
-  const url = local ?? streamUrl(it.track.videoId);
+  const url = local ?? playUrl(it.track);
   el.src = url;
   assign(el, it.track.videoId, url);
   if (local) set({ source: "local", streamKbps: null });
@@ -435,7 +454,7 @@ function loadSrc(track: Track, autoplay: boolean, fadeSeconds: number, token: nu
 
   const local = localUrl(track.videoId);
   if (local || !isTailnet()) {
-    const url = local ?? streamUrl(track.videoId);
+    const url = local ?? playUrl(track);
     audio.src = url;
     assign(audio, track.videoId, url);
     activeVideoId = track.videoId;
@@ -478,7 +497,7 @@ function setSrcDual(track: Track, autoplay: boolean, fadeSeconds: number, token:
   }
   const local = localUrl(track.videoId);
   if (local || !isTailnet()) {
-    const url = local ?? streamUrl(track.videoId);
+    const url = local ?? playUrl(track);
     el.src = url;
     assign(el, track.videoId, url);
     if (local) set({ source: "local" });
@@ -571,7 +590,7 @@ function maybePreload() {
     return;
   }
   const local = localUrl(videoId);
-  const key = local ?? streamUrl(videoId); // includes the quality budget
+  const key = local ?? playUrl(n.track); // includes the quality budget
   if (spare && spare.el === el && spare.videoId === videoId) {
     // Already preloaded. Redo it only if the quality budget changed and it isn't fully loaded yet.
     const full = isFinite(el.duration) && loadedFromStart(el) >= el.duration - 1;
@@ -813,6 +832,17 @@ on("error", () => {
     // The file in the music folder couldn't be played (moved, unreadable): the server plays it.
     skipLocal(it.track.videoId);
     setSrc(it.track, true);
+    return;
+  }
+  if (audio.src.includes("/hls")) {
+    // The HLS playlist didn't play: the plain stream, from the same spot.
+    hlsFailed.add(it.track.videoId);
+    const at = audio.currentTime;
+    const url = streamUrl(it.track.videoId);
+    audio.src = url;
+    assign(audio, it.track.videoId, url);
+    if (at > 0) audio.addEventListener("loadedmetadata", () => (audio.currentTime = at), { once: true });
+    audio.play().catch(() => {});
     return;
   }
   if (!triedFallback) {

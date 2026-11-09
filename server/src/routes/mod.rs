@@ -57,6 +57,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/tracks/{video_id}/youtube/retry", post(music::retry_youtube_match))
         .route("/missing", get(music::missing))
         .route("/stream/{video_id}", get(stream::stream))
+        .route("/stream/{video_id}/hls", get(stream::hls))
         .route("/history", get(music::history))
         .route("/playback", post(settings::playback_event))
         // queue

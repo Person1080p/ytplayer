@@ -16,6 +16,8 @@
   --bar-h: 64px;
   --nav-h: 58px;
   --safe-b: env(safe-area-inset-bottom, 0px);
+  /* How far the screen goes past the viewport fixed elements use (iOS home-screen apps; lib/viewport.ts). */
+  --vp-gap: 0px;
   color-scheme: dark;
 }
 
@@ -75,13 +77,13 @@ code { background: var(--bg-3); padding: 1px 5px; border-radius: 4px; font-size:
   /* overflow-x: no sideways drag of the whole page */
   .content { overflow-x: hidden; padding-bottom: calc(var(--bar-h) + var(--nav-h) + var(--safe-b) + 16px); padding-top: env(safe-area-inset-top, 0px); }
   .bottom-nav {
-    display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    display: flex; position: fixed; left: 0; right: 0; bottom: calc(0px - var(--vp-gap)); z-index: 20;
     height: calc(var(--nav-h) + var(--safe-b)); padding-bottom: var(--safe-b);
     background: rgba(10, 10, 13, 0.96); backdrop-filter: blur(12px); border-top: 1px solid var(--line);
   }
   .bottom-nav .nav-link { flex: 1; flex-direction: column; gap: 2px; padding: 8px 0 4px; font-size: 11px; border-radius: 0; background: none; }
   .bottom-nav .nav-link.active { color: var(--accent); }
-  .player-bar { bottom: calc(var(--nav-h) + var(--safe-b)) !important; left: 6px !important; right: 6px !important; border-radius: 12px; }
+  .player-bar { bottom: calc(var(--nav-h) + var(--safe-b) - var(--vp-gap)) !important; left: 6px !important; right: 6px !important; border-radius: 12px; }
   .hide-mobile { display: none !important; }
   h1 { font-size: 22px; }
 }
@@ -205,7 +207,7 @@ a.btn { text-decoration: none; }
 
 /* ---- player bar ---- */
 .player-bar {
-  position: fixed; left: 220px; right: 0; bottom: 0; z-index: 25; height: var(--bar-h);
+  position: fixed; left: 220px; right: 0; bottom: calc(0px - var(--vp-gap)); z-index: 25; height: var(--bar-h);
   background: rgba(23, 23, 28, 0.97); backdrop-filter: blur(14px); border-top: 1px solid var(--line); overflow: hidden;
 }
 .player-bar-inner { display: flex; align-items: center; height: 100%; padding: 0 10px; gap: 8px; }
@@ -247,7 +249,7 @@ a.btn { text-decoration: none; }
 
 /* ---- now playing ---- */
 .now-playing {
-  position: fixed; inset: 0; z-index: 40; background: var(--bg); display: flex; flex-direction: column; align-items: center;
+  position: fixed; inset: 0 0 calc(0px - var(--vp-gap)); z-index: 40; background: var(--bg); display: flex; flex-direction: column; align-items: center;
   padding: calc(env(safe-area-inset-top, 0px) + 8px) 24px calc(var(--safe-b) + clamp(10px, 3vh, 24px)); overflow: hidden auto;
   overscroll-behavior: none; animation: slide-up 0.22s ease-out;
 }
@@ -292,7 +294,7 @@ a.btn { text-decoration: none; }
 .now-playing > :not(.np-art) { flex-shrink: 0; }
 
 /* ---- sheets / toast ---- */
-.sheet-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 50; display: flex; align-items: flex-end; justify-content: center; animation: fade 0.15s; }
+.sheet-backdrop { position: fixed; inset: 0 0 calc(0px - var(--vp-gap)); background: rgba(0, 0, 0, 0.55); z-index: 50; display: flex; align-items: flex-end; justify-content: center; animation: fade 0.15s; }
 @keyframes fade { from { opacity: 0; } }
 .sheet { background: var(--bg-2); width: 100%; max-width: 520px; border-radius: 18px 18px 0 0; padding: 8px 12px calc(var(--safe-b) + 14px); max-height: 80vh; overflow-y: auto; overscroll-behavior: contain; animation: slide-up 0.18s ease-out; }
 @media (min-width: 761px) { .sheet-backdrop { align-items: center; } .sheet { border-radius: 18px; } }
@@ -302,7 +304,7 @@ a.btn { text-decoration: none; }
 .sheet-item { display: flex; align-items: center; gap: 14px; width: 100%; padding: 13px 10px; border-radius: 10px; text-align: left; }
 .sheet-item:hover { background: var(--bg-3); }
 .sheet-list { margin-top: 10px; }
-.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--bar-h) + var(--nav-h) + var(--safe-b) + 18px); background: var(--text); color: var(--bg); padding: 10px 18px; border-radius: 999px; font-weight: 500; z-index: 60; max-width: 90vw; text-align: center; animation: fade 0.2s; }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--bar-h) + var(--nav-h) + var(--safe-b) + 18px - var(--vp-gap)); background: var(--text); color: var(--bg); padding: 10px 18px; border-radius: 999px; font-weight: 500; z-index: 60; max-width: 90vw; text-align: center; animation: fade 0.2s; }
 
 /* ---- panels ---- */
 .panel { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 16px; }

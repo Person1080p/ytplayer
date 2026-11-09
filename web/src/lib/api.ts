@@ -573,6 +573,15 @@ export function streamUrl(videoId: string, via?: "youtube" | "pipe") {
   return `/api${streamPath(videoId, via)}`;
 }
 
+/**
+ * An HLS playlist of the song's YouTube file (the server redirects to `streamUrl` when it plays
+ * from elsewhere). For Safari, which otherwise reads a long song's whole file before playing it.
+ */
+export function hlsUrl(videoId: string) {
+  const rev = sourceRevs[videoId];
+  return `/api${withArgs(`/stream/${enc(videoId)}/hls`, [...qualityArgs(), ...(rev ? [`rev=${rev}`] : [])])}`;
+}
+
 export function fmtTime(sec?: number | null) {
   if (sec == null || !isFinite(sec)) return "–:––";
   const s = Math.max(0, Math.floor(sec));
