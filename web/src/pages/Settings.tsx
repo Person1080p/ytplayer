@@ -772,6 +772,9 @@ function Version({ status }: { status: Status }) {
   const serverAt = toSecs(v?.builtAt);
   const appAt = toSecs(APP_BUILT_AT);
   const pageOlder = differ && serverAt != null && appAt != null ? appAt < serverAt : null;
+  // Through the in-page tailnet the new version can't be fetched (the page's own address doesn't
+  // answer), and reloading would only stop the tailnet connection and start it over.
+  const away = useConnection((s) => s.conn?.mode === "tailnet");
   return (
     <Section title="Version" state={differ ? "warn" : server || app ? "ok" : undefined} id="version">
       <BuildLine label="Server" commit={server} dirty={!!v?.dirty} builtAt={v?.builtAt ?? null} />
@@ -783,11 +786,14 @@ function Version({ status }: { status: Status }) {
             : pageOlder
               ? "This page is older than the server: refresh the page to load the new version."
               : "This page and the server were built from different commits: refresh the page."}{" "}
-          {pageOlder !== false && (
-            <button className="link-btn" onClick={() => location.reload()}>
-              Refresh now
-            </button>
-          )}
+          {pageOlder !== false &&
+            (away ? (
+              <span>It loads by itself the next time this device is on your home network.</span>
+            ) : (
+              <button className="link-btn" onClick={() => location.reload()}>
+                Refresh now
+              </button>
+            ))}
         </p>
       ) : server && app ? (
         <p className="small muted">The page and the server are the same version.</p>

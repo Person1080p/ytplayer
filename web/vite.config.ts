@@ -62,10 +62,16 @@ export default defineConfig({
       workbox: {
         // API calls (and especially audio streams) must always hit the server.
         navigateFallbackDenylist: [/^\/api\//],
-        globIgnores: ["tailnet/**", "**/*.gz"],
+        // The Tailscale module (~28 MB) is precached with the app: a new version doesn't take over
+        // until it's stored, so the fallback can always start away from home, where this address
+        // can't serve it. Unchanged between versions, it isn't downloaded again.
+        globIgnores: ["**/*.gz"],
+        maximumFileSizeToCacheInBytes: 64 * 1024 * 1024,
+        // The page asks for `/tailnet/…?v=<hash>`; the precache keeps it under the plain path.
+        ignoreURLParametersMatching: [/^utm_/, /^fbclid$/, /^v$/],
         runtimeCaching: [
           {
-            // The ~28 MB Tailscale WASM module: versioned URL, so cache it forever once downloaded.
+            // Fallback for the precached Tailscale module (versioned URL, so cached forever).
             urlPattern: ({ url }) => url.pathname.startsWith("/tailnet/"),
             handler: "CacheFirst",
             options: { cacheName: "tailnet", expiration: { maxEntries: 4 }, cacheableResponse: { statuses: [200] } },
