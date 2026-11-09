@@ -428,7 +428,7 @@ async fn youtube_stream(
                     thumbnail: resolved.thumbnail.clone(),
                 },
             });
-            match proxy(&st.http, &resolved.url, range.clone(), &extra, Some(&resolved.mime), tee).await {
+            match proxy_youtube(&st.http, &resolved.url, range.clone(), &extra, &resolved.mime, tee).await {
                 Ok(resp) => return Tried::Played(with_kbps(with_source(resp, "youtube"), resolved.kbps)),
                 Err(e) => {
                     tracing::warn!("googlevideo proxy failed (attempt {attempt}): {e:#}");
@@ -782,9 +782,141 @@ async fn proxy(
     Ok(builder.body(Body::from_stream(body))?.into_response())
 }
 
+/// googlevideo sends a range of up to ~10 MB at full speed, but a larger or open-ended one (what
+/// browsers ask for, `bytes=0-`) at about twice the audio's bitrate: a whole song takes most of its
+/// own length to arrive, an hour-long mix most of an hour. So longer ranges are fetched in pieces
+/// of this size, the next one asked for while the current one streams.
+const YT_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// A request's byte range as (first, last if given). None: no Range header. Err: one this can't
+/// split (a suffix range, several ranges, nonsense), which is passed on as it is.
+fn simple_range(range: Option<&HeaderValue>) -> Result<Option<(u64, Option<u64>)>, ()> {
+    let Some(r) = range else { return Ok(None) };
+    let spec = r.to_str().map_err(|_| ())?.trim().strip_prefix("bytes=").ok_or(())?;
+    if spec.contains(',') {
+        return Err(());
+    }
+    let (a, b) = spec.split_once('-').ok_or(())?;
+    let start = a.trim().parse::<u64>().map_err(|_| ())?;
+    let end = match b.trim() {
+        "" => None,
+        b => Some(b.parse::<u64>().map_err(|_| ())?).filter(|e| *e >= start).ok_or(())?.into(),
+    };
+    Ok(Some((start, end)))
+}
+
+/// The pieces [first, last] that cover bytes `start..=end`.
+fn chunks(start: u64, end: u64, size: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut a = start;
+    while a <= end {
+        let b = (a + size - 1).min(end);
+        out.push((a, b));
+        a = b + 1;
+    }
+    out
+}
+
+/// `proxy` for YouTube's file: ranges longer than [`YT_CHUNK`] are fetched in pieces and sent on
+/// as one response, with the headers a single request would have had.
+async fn proxy_youtube(
+    http: &reqwest::Client,
+    url: &str,
+    range: Option<HeaderValue>,
+    extra: &[(String, String)],
+    mime: &str,
+    tee: Option<Tee<'_>>,
+) -> anyhow::Result<Response> {
+    let Ok(asked) = simple_range(range.as_ref()) else {
+        return proxy(http, url, range, extra, Some(mime), tee).await;
+    };
+    let (start, asked_end) = asked.unwrap_or((0, None));
+    let get = |a: u64, b: u64| {
+        let mut req = http.get(url).header(header::RANGE, format!("bytes={a}-{b}"));
+        for (k, v) in extra {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req.send()
+    };
+    let first_end = asked_end.map_or(start + YT_CHUNK - 1, |e| e.min(start + YT_CHUNK - 1));
+    let first = get(start, first_end).await?;
+    let status = first.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        return proxy(http, url, range, extra, Some(mime), tee).await;
+    }
+    if status != StatusCode::PARTIAL_CONTENT {
+        anyhow::bail!("upstream returned {status}");
+    }
+    let Some((_, total)) = body_span(status, first.headers()) else {
+        anyhow::bail!("upstream sent no length");
+    };
+    let end = asked_end.map_or(total - 1, |e| e.min(total - 1));
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, end - start + 1);
+    builder = if asked.is_some() {
+        builder.status(StatusCode::PARTIAL_CONTENT).header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+    } else {
+        builder.status(StatusCode::OK)
+    };
+    for name in [header::LAST_MODIFIED, header::ETAG] {
+        if let Some(v) = first.headers().get(name.as_str()) {
+            builder = builder.header(name, v.as_bytes());
+        }
+    }
+
+    use futures::{stream, StreamExt, TryStreamExt};
+    type Chunks = futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>;
+    fn io(e: reqwest::Error) -> std::io::Error {
+        std::io::Error::other(e)
+    }
+    let head: Chunks = first.bytes_stream().map_err(io).boxed();
+    let rest_ranges = if first_end < end { chunks(first_end + 1, end, YT_CHUNK) } else { Vec::new() };
+    let requests: Vec<_> = rest_ranges.into_iter().map(|(a, b)| get(a, b)).collect();
+    let rest: Chunks = stream::iter(requests)
+        .buffered(2)
+        .map(|resp| -> Chunks {
+            match resp {
+                Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => r.bytes_stream().map_err(io).boxed(),
+                Ok(r) => stream::once(async move { Err(std::io::Error::other(format!("upstream returned {}", r.status()))) }).boxed(),
+                Err(e) => stream::once(async move { Err(io(e)) }).boxed(),
+            }
+        })
+        .flatten()
+        .boxed();
+    let copy = tee.and_then(|t| t.cache.tee(t.video_id, start, total, t.meta));
+    let body = head.chain(rest).map(move |chunk| {
+        if let (Some(tx), Ok(bytes)) = (&copy, &chunk) {
+            let _ = tx.send(bytes.clone());
+        }
+        chunk
+    });
+    Ok(builder.body(Body::from_stream(body))?.into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_ranges() {
+        let h = |s: &str| HeaderValue::from_str(s).unwrap();
+        assert_eq!(simple_range(None), Ok(None));
+        assert_eq!(simple_range(Some(&h("bytes=0-"))), Ok(Some((0, None))));
+        assert_eq!(simple_range(Some(&h("bytes=100-199"))), Ok(Some((100, Some(199)))));
+        assert_eq!(simple_range(Some(&h("bytes=-500"))), Err(()));
+        assert_eq!(simple_range(Some(&h("bytes=0-1,5-9"))), Err(()));
+        assert_eq!(simple_range(Some(&h("bytes=9-3"))), Err(()));
+    }
+
+    #[test]
+    fn chunk_pieces() {
+        assert_eq!(chunks(0, 9, 4), vec![(0, 3), (4, 7), (8, 9)]);
+        assert_eq!(chunks(5, 5, 4), vec![(5, 5)]);
+        assert_eq!(chunks(0, 7, 4), vec![(0, 3), (4, 7)]);
+    }
 
     #[test]
     fn range_starts() {
