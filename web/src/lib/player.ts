@@ -191,15 +191,23 @@ const nativeHls = (() => {
     return false;
   }
 })();
-/** Songs at least this long (s) go to Safari as HLS (see `hlsUrl`); shorter ones load quickly anyway. */
-const HLS_FROM_SECONDS = 600;
 /** Songs whose HLS playlist failed this session: they use the plain stream. */
 const hlsFailed = new Set<string>();
+/** Where the server last said each song plays from (`/source`). */
+const knownSource = new Map<string, AudioSource>();
 
-/** The server URL to play a track from: the plain stream, or for a long song in Safari its HLS playlist. */
+/**
+ * Safari plays YouTube songs from an HLS playlist of the file (`hlsUrl`): read as a plain file it
+ * misjudges the length (twice the real one, the rest silence) and reads a long song's whole file
+ * before starting. It needs to know the source first: other sources play their file directly.
+ */
+const hlsWanted = () => nativeHls && !opusOk && !isTailnet();
+
+/** The server URL to play a track from: the plain stream, or in Safari a YouTube song's HLS playlist. */
 function playUrl(track: Track): string {
-  const hls = nativeHls && !opusOk && !isTailnet() && (track.duration ?? 0) >= HLS_FROM_SECONDS && !hlsFailed.has(track.videoId);
-  return hls ? hlsUrl(track.videoId) : streamUrl(track.videoId);
+  const id = track.videoId;
+  const hls = hlsWanted() && knownSource.get(id) === "youtube" && !hlsFailed.has(id);
+  return hls ? hlsUrl(id) : streamUrl(id);
 }
 
 function publishBuffered() {
@@ -455,6 +463,7 @@ function loadSrc(track: Track, autoplay: boolean, fadeSeconds: number, token: nu
   if (dual) return setSrcDual(track, autoplay, fadeSeconds, token);
 
   const local = localUrl(track.videoId);
+  if (!local && hlsWanted()) return loadAfterSource(track, autoplay, token);
   if (local || !isTailnet()) {
     const url = local ?? playUrl(track);
     audio.src = url;
@@ -481,6 +490,30 @@ function loadSrc(track: Track, autoplay: boolean, fadeSeconds: number, token: nu
       if (token !== loadToken) return;
       get().toastMsg(`Couldn't load “${track.title}”: ${(e as Error).message}`);
       set({ buffering: false });
+    });
+}
+
+/** Safari: ask where the song plays from, then load the matching URL (see `playUrl`). */
+function loadAfterSource(track: Track, autoplay: boolean, token: number) {
+  const id = track.videoId;
+  api
+    .source(id)
+    .then(
+      (s) => s,
+      () => null,
+    )
+    .then((s) => {
+      if (token !== loadToken) return;
+      if (s) knownSource.set(id, s.source);
+      const url = playUrl(track);
+      audio.src = url;
+      assign(audio, id, url);
+      activeVideoId = id;
+      if (s) {
+        setKbps(audio, id, s.kbps ?? typicalKbps(s.source));
+        set({ source: s.source });
+      }
+      if (autoplay) audio.play().catch(() => {});
     });
 }
 
@@ -528,6 +561,7 @@ function fetchSource(el: HTMLAudioElement, videoId: string, token: number) {
   api
     .source(videoId)
     .then((s) => {
+      knownSource.set(videoId, s.source);
       setKbps(el, videoId, s.kbps ?? typicalKbps(s.source));
       if (token === loadToken) set({ source: s.source });
     })
