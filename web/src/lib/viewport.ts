@@ -19,8 +19,33 @@ function update() {
   document.documentElement.classList.toggle("vp-short", gap > 0);
 }
 
+/**
+ * Zooming makes iOS lay the viewport out again, which ends the shortfall (zooming in by hand made
+ * the tab bar fit). With zoom off, do the same once, invisibly: scale by 0.1 % and back, then
+ * measure again. If the shortfall stays, nothing else changes.
+ */
+let nudged = false;
+function nudge() {
+  const meta = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
+  if (nudged || !meta || !document.documentElement.classList.contains("vp-short")) return;
+  nudged = true;
+  const content = meta.content;
+  meta.content = content.replace("initial-scale=1,", "initial-scale=1.001,").replace("maximum-scale=1,", "maximum-scale=1.001,");
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => {
+      meta.content = content;
+      setTimeout(update, 300);
+    }),
+  );
+}
+
 export function watchViewport() {
   update();
   window.addEventListener("resize", update);
   window.addEventListener("orientationchange", () => setTimeout(update, 300));
+  if (iosStandalone) setTimeout(nudge, 500);
+  // Safari's own pinch events: iOS can ignore `user-scalable=no`.
+  for (const type of ["gesturestart", "gesturechange"]) {
+    document.addEventListener(type, (e) => e.preventDefault(), { passive: false });
+  }
 }

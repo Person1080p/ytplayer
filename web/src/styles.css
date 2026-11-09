@@ -27,6 +27,8 @@
 html, body, #root { height: 100%; }
 /* The page's own rubber-band bounce: only the root element's value applies to it, not body's. */
 html { overscroll-behavior: none; }
+/* An app, not a document: scrolling yes, pinch-zoom no (with the viewport tag and lib/viewport.ts). */
+html, body { touch-action: pan-x pan-y; }
 /* The strip below the fixed-element viewport (see --vp-gap) shows the page canvas: the tab bar's
    colour, so the bar seems to reach the screen's edge. */
 html.vp-short { background: rgb(10, 10, 13); }
