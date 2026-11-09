@@ -391,51 +391,6 @@ function unlockAudio() {
   audio.play().catch(() => {});
 }
 
-// ---- iOS "Now Playing" presence --------------------------------------------------------------
-// iOS sends the play/pause of headphones, the lock screen and Shortcuts' Play/Pause to the app that
-// last played audio. On opening, a 0.3 s tone nobody can hear (19 kHz, very quiet) makes this app
-// that one, showing the song where the queue left off, so a play/pause right after opening (e.g.
-// a Shortcuts automation when headphones connect) starts the music. It plays on its own element:
-// the song stays loaded in the player. iOS may refuse sound before the first tap; then it says so.
-
-const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-
-function toneWav(): string {
-  const rate = 48000;
-  const n = Math.round(rate * 0.3);
-  const b = new ArrayBuffer(44 + n * 2);
-  const v = new DataView(b);
-  const w = (o: number, s: string) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
-  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  w(36, "data"); v.setUint32(40, n * 2, true);
-  const fade = Math.round(rate * 0.02); // no click at either end
-  for (let i = 0; i < n; i++) {
-    const env = Math.min(1, i / fade, (n - 1 - i) / fade);
-    v.setInt16(44 + i * 2, Math.round(Math.sin((2 * Math.PI * 19000 * i) / rate) * 40 * env), true);
-  }
-  return URL.createObjectURL(new Blob([b], { type: "audio/wav" }));
-}
-
-function announceToIOS() {
-  if (!isIOS) return;
-  const tone = makeAudio();
-  tone.src = toneWav();
-  tone.addEventListener(
-    "ended",
-    () => {
-      URL.revokeObjectURL(tone.src);
-      // Still "Now Playing", now paused: the next play goes to the player (see setActionHandler).
-      if ("mediaSession" in navigator && audio.paused) navigator.mediaSession.playbackState = "paused";
-    },
-    { once: true },
-  );
-  tone.play().catch((e: Error) => {
-    if (e.name === "NotAllowedError") get().toastMsg("iOS didn't let the app make sound before a tap, so play/pause from outside won't reach it yet");
-  });
-}
-
 // ---- tailnet audio blobs -----------------------------------------------------------------
 
 type Loaded = { url: string; source: AudioSource | null; kbps: number | null };
@@ -1212,7 +1167,6 @@ export async function initPlayer() {
       set({ buffering: false });
     }
     get().setQueue(q);
-    if (it) announceToIOS();
   } catch {
     /* unauthorized or offline; UI handles it */
   }
