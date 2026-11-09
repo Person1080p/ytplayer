@@ -124,10 +124,14 @@ a.btn { text-decoration: none; }
 .icon-btn { display: inline-grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; color: var(--text); flex-shrink: 0; }
 .icon-btn:hover { background: var(--bg-3); }
 .icon-btn.tiny { width: 22px; height: 18px; font-size: 9px; border-radius: 4px; color: var(--muted); }
-.icon-btn.play { background: var(--text); color: var(--bg); }
+.icon-btn.play { position: relative; background: var(--text); color: var(--bg); }
 .icon-btn.play.big { width: 72px; height: 72px; }
-.icon-btn.loading { animation: pulse 1s infinite ease-in-out; }
-@keyframes pulse { 50% { opacity: 0.5; } }
+/* Loading: an arc spinning around the play button. */
+.icon-btn.play.loading::after {
+  content: ""; position: absolute; inset: -5px; border-radius: 50%; pointer-events: none;
+  border: 2.5px solid transparent; border-top-color: var(--accent); animation: spin 0.8s linear infinite;
+}
+.icon-btn.play.big.loading::after { inset: -7px; border-width: 3px; }
 
 .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; }
 .switch.block { display: flex; margin: 10px 0; }
@@ -251,6 +255,7 @@ a.btn { text-decoration: none; }
 .badge.cache { background: var(--ok); color: #111; }
 .badge.jellyfin { background: #aa5cc3; color: white; }
 .badge.local { background: #3b82f6; color: white; }
+.badge.loading { background: var(--bg-3); color: var(--muted); }
 
 /* ---- now playing ---- */
 .now-playing {

@@ -62,6 +62,10 @@ function SourceBadge() {
   const source = useStore((s) => s.source);
   const kbps = useStore((s) => s.streamKbps);
   const budget = useStore((s) => s.qualityBudget);
+  const buffering = useStore((s) => s.buffering);
+  const playing = useStore((s) => s.playing);
+  // While the song is loading (or waiting for more of it): a gray "Loading" in its place.
+  if (buffering && playing) return <span className="badge loading">Loading</span>;
   if (!source) return null;
   const name = SOURCE_LABELS[source] ?? source;
   const tip = [source === "cache" ? "MP3 copy the server kept from a recent YouTube play" : "", kbps ? `${kbps} kbps` : ""]

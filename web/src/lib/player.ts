@@ -465,7 +465,9 @@ function beginSession(track: Track) {
 function setSrc(track: Track, autoplay: boolean, fadeSeconds = 0) {
   triedFallback = false;
   const token = ++loadToken;
-  set({ source: null, position: 0, duration: track.duration ?? 0, buffering: true, buffered: [], streamKbps: null });
+  pending = true;
+  // `playing`: what it will do once loaded, so the button shows that (with the loading ring).
+  set({ source: null, position: 0, duration: track.duration ?? 0, buffering: true, buffered: [], streamKbps: null, playing: autoplay });
   updateMediaSession(track);
   scheduleWarmNext();
   quiet();
@@ -488,12 +490,15 @@ function loadSrc(track: Track, autoplay: boolean, fadeSeconds: number, token: nu
     audio.src = url;
     assign(audio, track.videoId, url);
     activeVideoId = track.videoId;
+    loaded();
     if (autoplay) audio.play().catch(() => {});
     if (local) set({ source: "local", streamKbps: null });
     else fetchSource(audio, track.videoId, token);
     return;
   }
 
+  // The previous song stops while this one downloads.
+  audio.pause();
   loadBlob(track.videoId)
     .then((l) => {
       if (token !== loadToken) return;
@@ -501,26 +506,30 @@ function loadSrc(track: Track, autoplay: boolean, fadeSeconds: number, token: nu
       audio.src = l.url;
       assign(audio, track.videoId, l.url, l.kbps);
       activeVideoId = track.videoId;
+      loaded();
       set({ source: l.source, streamKbps: l.kbps });
       if (autoplay) audio.play().catch(() => {});
       else set({ buffering: false });
     })
     .catch((e) => {
       if (token !== loadToken) return;
+      loaded();
       get().toastMsg(`Couldn't load “${track.title}”: ${(e as Error).message}`);
-      set({ buffering: false });
+      set({ buffering: false, playing: false });
     });
 }
 
 /** Safari: ask where the song plays from, then load the matching URL (see `playUrl`). */
 function loadAfterSource(track: Track, autoplay: boolean, token: number) {
   const id = track.videoId;
+  audio.pause();
   void sourceFirst(id).then((s) => {
       if (token !== loadToken) return;
       const url = playUrl(track);
       audio.src = url;
       assign(audio, id, url);
       activeVideoId = id;
+      loaded();
       if (s) {
         setKbps(audio, id, s.kbps ?? typicalKbps(s.source));
         set({ source: s.source });
@@ -583,8 +592,9 @@ function setSrcDual(track: Track, autoplay: boolean, fadeSeconds: number, token:
     })
     .catch((e) => {
       if (token !== loadToken) return;
+      loaded();
       get().toastMsg(`Couldn't load “${track.title}”: ${(e as Error).message}`);
-      set({ buffering: false });
+      set({ buffering: false, playing: false });
     });
 }
 
@@ -603,6 +613,7 @@ function fetchSource(el: HTMLAudioElement, videoId: string, token: number) {
 function activate(el: HTMLAudioElement, videoId: string, autoplay: boolean, fadeSeconds: number) {
   const old = audio;
   audio = el;
+  loaded();
   activeVideoId = videoId;
   lastReportAt = 0;
   quiet();
@@ -834,10 +845,21 @@ function scheduleWarmNext() {
 // Both elements get the listeners; only the active one drives the UI and the queue. The spare's
 // (preloading) and a fading-out element's events are ignored, except a failed preload.
 
+/**
+ * A new song is on its way (looking up its source, or downloading it through the tailnet) and the
+ * element still holds the previous one: its events (time, length, pause, ending) aren't the new
+ * song's, so they're ignored until the new song is in place (`loaded`).
+ */
+let pending = false;
+/** The new song is in the playing element: its events count again. */
+function loaded() {
+  pending = false;
+}
+
 function on(type: string, fn: (el: HTMLAudioElement) => void) {
   for (const el of els) {
     el.addEventListener(type, () => {
-      if (el === audio && !isSilentEl(el)) fn(el);
+      if (el === audio && !isSilentEl(el) && !pending) fn(el);
     });
   }
 }
