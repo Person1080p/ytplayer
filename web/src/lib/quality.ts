@@ -28,8 +28,15 @@ const UNLIMITED_ABOVE = 640;
 const TAILNET_MAX = 128;
 const TAILNET_START = 96;
 
-/** Whether this browser plays WebM/Opus; otherwise the server picks AAC formats. */
+/**
+ * Whether this browser plays WebM/Opus; otherwise the server picks AAC formats. Not Safari's
+ * engine (every iOS browser), whatever it says: it claims WebM/Opus but fails YouTube's WebM
+ * streams partway (when playback reaches the end of what's loaded) and misreports their length.
+ */
 export const opusOk = (() => {
+  const ua = navigator.userAgent;
+  const webkit = /AppleWebKit\//.test(ua) && !/(Chrome|Chromium|Edg)\//.test(ua);
+  if (webkit) return false;
   try {
     return new Audio().canPlayType('audio/webm; codecs="opus"') !== "";
   } catch {

@@ -252,6 +252,8 @@ setInterval(() => {
 function onStall() {
   if (audio.paused || isTailnet()) return;
   const lower = reportStall(info.get(audio)?.kbps ?? null);
+  // Without Opus, YouTube has only the one AAC file that plays right: a reload gets the same.
+  if (!opusOk && get().source === "youtube") return;
   if (!lower || performance.now() - lastQualityReload < 20000) return;
   lastQualityReload = performance.now();
   get().toastMsg("Slow connection to the server: switching to lower quality");

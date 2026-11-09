@@ -1,8 +1,8 @@
 // iOS home-screen apps with a translucent status bar (index.html) lay fixed elements out in a
-// viewport that ends short of the screen's bottom edge by about the top safe area, though the page
-// itself is drawn to the edge: the tab bar, player and full-screen views float above a strip of
-// background. `--vp-gap` is that shortfall, measured, and the fixed elements reach down by it
-// (styles.css). Elsewhere, or once iOS gets it right, it's 0.
+// viewport that ends short of the screen's bottom edge by about the top safe area, and clip them
+// there, though the page canvas is drawn to the edge. `--vp-gap` is that shortfall, measured: the
+// strip covers the home indicator, so the tab bar drops its own inset for it, and the strip gets
+// the bar's colour (`vp-short`, styles.css). Elsewhere, or once iOS gets it right, it's 0.
 
 const iosStandalone = (navigator as Navigator & { standalone?: boolean }).standalone === true;
 
@@ -16,6 +16,7 @@ function update() {
     if (short > 0 && short <= 100) gap = short;
   }
   document.documentElement.style.setProperty("--vp-gap", `${gap}px`);
+  document.documentElement.classList.toggle("vp-short", gap > 0);
 }
 
 export function watchViewport() {
