@@ -36,6 +36,22 @@ For development, `scripts/dev.sh` runs the backend and Vite at http://localhost:
 
 For the in-page Tailscale mode, also install Go and run `scripts/build-tailnet-wasm.sh` before `npm run build`.
 
+### Docker (e.g. on a NAS)
+
+```bash
+YTP_ACCESS_TOKEN=<a long random string> TZ=America/New_York docker compose up -d --build   # http://<host>:8080
+```
+
+The image builds everything itself (server, embedded Tailscale node, web app with its in-page Tailscale module) and includes ffmpeg and Deno, which yt-dlp needs for YouTube.
+
+- **Data.** Everything lives in the `data` volume at `/data`. To move an install, copy `server/data` there, owned by uid 1000. `bin/` (yt-dlp) and `logs/` can be left out.
+- **Access token.** In Docker the server listens beyond localhost, so set `YTP_ACCESS_TOKEN`.
+- **What doesn't work in a container.** Two features need a desktop on the server machine:
+  - **Sign in with Google** reads a browser on the server machine. Paste the `cookie` header from another device instead.
+  - The **Spotify Downloads-folder pickup** watches a Downloads folder on the server machine.
+- **Installing it as an app.** Browsers only allow this over HTTPS. Use the embedded node's `https://ytp.<tailnet>.ts.net` address.
+- **Version.** Pass the commit as the `YTP_GIT_COMMIT` variable to show it in Settings.
+
 ## Getting it on your phone
 
 There are two ways a device can reach the server:

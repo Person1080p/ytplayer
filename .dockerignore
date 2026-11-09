@@ -1,0 +1,14 @@
+.git/
+.playwright-mcp/
+**/.env
+server/target/
+server/data/
+data/
+server/vendor/yt-dlp
+web/node_modules/
+web/dist/
+web/dev-dist/
+web/public/tailnet/
+*.sqlite3*
+tailscaled.state*
+*.tsbuildinfo

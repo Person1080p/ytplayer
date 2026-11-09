@@ -1,0 +1,24 @@
+# YTP Music in Docker: docker compose up -d --build, then open http://<host>:8080
+services:
+  ytp:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${YTP_GIT_COMMIT:-}
+    image: ytp-music:latest
+    restart: unless-stopped
+    init: true # reaps the yt-dlp and ffmpeg processes the server starts
+    stop_grace_period: 30s
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: ${TZ:-UTC}
+      # Anyone who can reach the port can use the app and its signed-in accounts unless this is set;
+      # the app then asks for it once per browser.
+      YTP_ACCESS_TOKEN: ${YTP_ACCESS_TOKEN:-}
+    volumes:
+      # SQLite database (sign-ins and tokens), Tailscale identity, cover art, audio cache and yt-dlp.
+      - data:/data
+
+volumes:
+  data:
