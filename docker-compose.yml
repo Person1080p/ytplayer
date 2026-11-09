@@ -12,8 +12,12 @@ services:
     stop_grace_period: 30s
     ports:
       - "8080:8080"
+      # The built-in Tailscale node's UDP port: lets devices connect directly instead of through
+      # Tailscale's relays (much faster). Forwarding it on the router helps further.
+      - "41641:41641/udp"
     environment:
       TZ: ${TZ:-UTC}
+      TS_PORT: "41641"
       # Anyone who can reach the port can use the app and its signed-in accounts unless this is set;
       # the app then asks for it once per browser.
       YTP_ACCESS_TOKEN: ${YTP_ACCESS_TOKEN:-}

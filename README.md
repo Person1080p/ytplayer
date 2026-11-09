@@ -97,6 +97,7 @@ Which server address to enter:
 How it works:
 - Browsers can't send UDP, so the in-page node's traffic is always relayed through Tailscale's DERP servers over WebSockets. It's still end-to-end WireGuard encrypted. Bandwidth is fine for music, but latency is higher than a direct connection.
 - API calls and the live queue stream go through the tunnel with `fetch()`. Audio can't be handed to `<audio>` by URL in this mode, so each track is downloaded into memory over the tunnel and the next track is prefetched. That also keeps auto-advance working while iOS has the app backgrounded.
+- Because a track only plays once it has fully downloaded, **Automatic** quality stays at 128 kbps or below in this mode, and starts at 96 kbps until a download has been timed. A lossless Plex file (often 50–100 MB) is sent as a Plex MP3 transcode instead. A speed measured over one connection (home Wi-Fi, say) isn't reused for the other. Choosing **High** in Settings lifts the limit.
 - The WASM module is about 28 MB (6.7 MB gzipped). It's downloaded once and cached by the service worker.
 - If your tailnet uses device approval or Tailnet Lock, approve or sign the new device in the admin console.
 
@@ -124,6 +125,7 @@ The server contains its own Tailscale node, built from a small Go wrapper around
 
 - The server joins your tailnet as `ytp` (`TS_HOSTNAME`). To sign it in, open **Settings → Connection** in the web app and click **Sign the server in to Tailscale**. The link is also printed in the server log. Alternatively, set `TS_AUTHKEY=tskey-auth-…` to join without signing in.
 - It serves plain HTTP on tailnet port 80, so the fallback server address is simply `http://ytp`. WireGuard already encrypts this traffic.
+- Set `TS_PORT` (e.g. `41641`) to give the node a fixed UDP port. In Docker, publish it (`41641:41641/udp`, as in `docker-compose.yml`). Devices with the Tailscale app can then usually connect directly instead of through Tailscale's relays, which is much faster. Forwarding that UDP port on the router makes direct connections work from almost any network.
 - If HTTPS certificates are enabled for your tailnet in the admin console, it also serves `https://ytp.<tailnet>.ts.net`, using a certificate it renews daily.
 - To turn it off at runtime, set `TS_EMBEDDED=0`. To build without it (and without needing Go), run `cargo build --no-default-features`.
 

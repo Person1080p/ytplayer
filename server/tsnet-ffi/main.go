@@ -28,6 +28,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -70,7 +71,11 @@ func ytp_ts_start(dir, hostname, authkey, controlURL *C.char) C.int {
 		return 0
 	}
 	verbose := os.Getenv("YTP_TS_VERBOSE") != ""
+	// A fixed UDP port (TS_PORT) can be published from a container or forwarded on the router, so
+	// devices reach the node directly instead of through Tailscale's relays. 0: any free port.
+	port, _ := strconv.ParseUint(os.Getenv("TS_PORT"), 10, 16)
 	s := &tsnet.Server{
+		Port:       uint16(port),
 		Dir:        C.GoString(dir),
 		Hostname:   C.GoString(hostname),
 		AuthKey:    C.GoString(authkey),
